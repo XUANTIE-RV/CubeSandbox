@@ -25,8 +25,8 @@ use crate::hypervisor;
 use crate::riscv64::aia::KvmAiaImsics;
 #[cfg(target_arch = "riscv64")]
 pub use crate::riscv64::{
-    aia::AiaImsicsState as AiaState, check_required_kvm_extensions, is_non_core_register,
-    VcpuKvmState,
+    aia::AiaImsicsState as AiaState, aia::AiaSnapshotConfig, check_required_kvm_extensions,
+    is_non_core_register, VcpuKvmState,
 };
 use crate::vec_with_array_field;
 use crate::vm::{self, InterruptSourceConfig, VmOps};
@@ -114,8 +114,16 @@ pub use kvm_ioctls::{Cap, Kvm};
 use std::mem;
 use thiserror::Error;
 use vfio_ioctls::VfioDeviceFd;
+#[cfg(target_arch = "riscv64")]
+use vmm_sys_util::ioctl::ioctl_with_mut_ref;
 #[cfg(feature = "tdx")]
 use vmm_sys_util::{ioctl::ioctl_with_val, ioctl_ioc_nr, ioctl_iowr_nr};
+// `ioctl_iowr_nr!` expands to a call to `ioctl_ioc_nr!`, so both macros must be
+// in scope to declare KVM_GET_REG_LIST for the riscv64 register-list probe.
+#[cfg(target_arch = "riscv64")]
+use log::{error, warn};
+#[cfg(target_arch = "riscv64")]
+use vmm_sys_util::{ioctl_ioc_nr, ioctl_iowr_nr};
 pub use {
     kvm_bindings::kvm_create_device as CreateDevice, kvm_bindings::kvm_device_attr as DeviceAttr,
     kvm_bindings::kvm_run, kvm_ioctls::VcpuExit,
@@ -123,6 +131,78 @@ pub use {
 
 #[cfg(target_arch = "x86_64")]
 const KVM_CAP_SGX_ATTRIBUTE: u32 = 196;
+
+// Zkr `seed` CSR. kvm-bindings exposes neither the CSR number nor the OPST
+// encoding, because both come from the kernel's asm/csr.h rather than from
+// kvm.h. KVM emulates no Zkr CSR in the kernel: `seed_csr_rmw()` exits to user
+// space whenever Zkr is in the vCPU ISA, and the VMM writes the value the guest
+// reads back into `kvm_run::riscv_csr::ret_value`. Only ES16 and DEAD are ever
+// produced here -- the host entropy source either yields 16 bits or it does
+// not, and DEAD rather than WAIT is the failure code so a guest that cannot get
+// entropy stops instead of spinning through its retry budget.
+#[cfg(target_arch = "riscv64")]
+const CSR_SEED: u64 = 0x015;
+#[cfg(target_arch = "riscv64")]
+const SEED_OPST_ES16: u64 = 0b10 << 30;
+#[cfg(target_arch = "riscv64")]
+const SEED_OPST_DEAD: u64 = 0b11 << 30;
+
+// kvm-bindings does not export the KVM_GET_REG_LIST ioctl number, and the
+// `kvm_bindings::RegList` FAM wrapper caps its entry count at
+// RISCV64_REGS_MAX (200), which a rv64GC guest already exceeds (244 on the
+// host this was measured on). Declare the ioctl here and issue it directly so
+// the register list can be sized from KVM -- see `riscv_reg_list()`.
+#[cfg(target_arch = "riscv64")]
+ioctl_iowr_nr!(
+    KVM_GET_REG_LIST,
+    kvm_bindings::KVMIO,
+    0xb0,
+    kvm_bindings::kvm_reg_list
+);
+
+#[cfg(target_arch = "riscv64")]
+/// Fetch every register id the kernel exposes for `fd`.
+///
+/// `kvm_bindings::RegList` cannot be used here: its FAM wrapper caps the entry
+/// count at `RISCV64_REGS_MAX` (200), which a rv64GC guest already exceeds, so
+/// `RegList::new()` refuses to allocate a buffer big enough for the answer KVM
+/// gives. Issue `KVM_GET_REG_LIST` directly instead.
+///
+/// The kernel writes the true count back before it returns `E2BIG`, so probing
+/// with `n = 0` sizes the buffer exactly. That is the two-step sequence
+/// `tools/testing/selftests/kvm/lib/kvm_util.c` uses.
+fn riscv_reg_list(fd: &VcpuFd) -> cpu::Result<Vec<u64>> {
+    let mut n = 0_u64;
+    // SAFETY: FFI call; the kernel reads `n` and overwrites it with the count
+    // of registers this vCPU exposes.
+    let ret = unsafe { ioctl_with_mut_ref(fd, KVM_GET_REG_LIST(), &mut n) };
+    if ret == 0 {
+        return Ok(Vec::new());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::E2BIG) {
+        return Err(cpu::HypervisorCpuError::GetRegList(err.into()));
+    }
+
+    // `kvm_reg_list` is `{ u64 n; u64 reg[]; }`, so a `Vec<u64>` carrying `n`
+    // in its first element is layout-compatible with it and can back the
+    // flexible array the kernel writes into.
+    let mut buf = vec![0_u64; n as usize + 1];
+    buf[0] = n;
+    // SAFETY: FFI call; `buf` holds `n + 1` contiguous u64s, which is the
+    // `kvm_reg_list` header plus room for the `n` ids just asked for.
+    let ret = unsafe { ioctl_with_mut_ref(fd, KVM_GET_REG_LIST(), &mut buf[0]) };
+    if ret < 0 {
+        return Err(cpu::HypervisorCpuError::GetRegList(
+            std::io::Error::last_os_error().into(),
+        ));
+    }
+
+    // KVM answers E2BIG rather than overrunning the buffer when the count grew,
+    // so reaching here means `buf[0] <= n`.
+    buf.truncate(buf[0] as usize + 1);
+    Ok(buf.split_off(1))
+}
 
 #[cfg(feature = "tdx")]
 const KVM_EXIT_TDX: u32 = 35;
@@ -484,6 +564,35 @@ impl vm::Vm for KvmVm {
             .fd
             .create_vcpu(id as u64)
             .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
+
+        // KVM ships the SBI debug console with `.default_disabled = true`
+        // (arch/riscv/kvm/vcpu_sbi_replace.c), and `kvm_vcpu_sbi_find_ext()`
+        // only hands out a handler for an extension whose status is ENABLED.
+        // Left alone, the guest's base-extension probe reports DBCN as absent
+        // and a DBCN ecall is answered SBI_ERR_NOT_SUPPORTED in the kernel, so
+        // neither produces an exit the VMM could handle. Enable it through the
+        // SBI-extension one-reg interface. The register value is an enable
+        // flag: riscv_vcpu_set_sbi_ext_single() stores `reg_val ? ENABLED :
+        // DISABLED`. KVM's DBCN handler then forwards every console call to
+        // user space unconditionally, which is the KVM_EXIT_RISCV_SBI arm vmm
+        // routes to the Serial device.
+        //
+        // The kernel refuses this with EBUSY once the vCPU has run, so it
+        // belongs here in create_vcpu rather than in a later setup step.
+        // Failure is not fatal: a kernel older than the one-reg interface
+        // answers ENOENT, and the guest simply keeps the console it has.
+        #[cfg(target_arch = "riscv64")]
+        {
+            let dbcn_enable = 1u64;
+            let dbcn_id = kvm_bindings::KVM_REG_RISCV as u64
+                | u64::from(kvm_bindings::KVM_REG_SIZE_U64)
+                | u64::from(kvm_bindings::KVM_REG_RISCV_SBI_EXT)
+                | u64::from(kvm_bindings::KVM_RISCV_SBI_EXT_ID_KVM_RISCV_SBI_EXT_DBCN);
+            if let Err(e) = fd.set_one_reg(dbcn_id, &dbcn_enable.to_le_bytes()) {
+                warn!("Failed to enable RISC-V SBI DBCN for vCPU {id}: {e}");
+            }
+        }
+
         let vcpu = KvmVcpu {
             fd: Arc::new(Mutex::new(fd)),
             #[cfg(target_arch = "x86_64")]
@@ -632,6 +741,16 @@ impl vm::Vm for KvmVm {
         self.fd
             .set_gsi_routing(&irq_routing[0])
             .map_err(|e| vm::HypervisorVmError::SetGsiRouting(e.into()))
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    ///
+    /// Sets the level of the interrupt controller input for `irq`.
+    ///
+    fn set_irq_line(&self, irq: u32, level: bool) -> vm::Result<()> {
+        self.fd
+            .set_irq_line(irq, level)
+            .map_err(|e| vm::HypervisorVmError::SetIrqLine(e.into()))
     }
     ///
     /// Creates a memory region structure that can be used with {create/remove}_user_memory_region
@@ -2342,7 +2461,15 @@ impl cpu::Vcpu for KvmVcpu {
     /// Triggers the running of the current virtual CPU returning an exit reason.
     ///
     fn run(&self) -> std::result::Result<cpu::VmExit, cpu::HypervisorCpuError> {
-        match self.fd.lock().unwrap().run() {
+        let mut vcpu_fd = self.fd.lock().unwrap();
+        // On riscv64 the forwarded SBI and CSR exits carry their payload only in
+        // the mmap'd kvm_run page. Take a raw pointer to it before run(): the
+        // VcpuExit that run() returns borrows the fd for the whole match, so an
+        // arm cannot otherwise reach the page through the fd.
+        #[cfg(target_arch = "riscv64")]
+        let krun = &raw mut *vcpu_fd.get_kvm_run();
+
+        match vcpu_fd.run() {
             Ok(run) => match run {
                 #[cfg(target_arch = "x86_64")]
                 VcpuExit::IoIn(addr, data) => {
@@ -2374,8 +2501,8 @@ impl cpu::Vcpu for KvmVcpu {
                 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
                 VcpuExit::SystemEvent(event_type, flags) => {
                     use kvm_bindings::{KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
-                    // On Aarch64, when the VM is shutdown, run() returns
-                    // VcpuExit::SystemEvent with reason KVM_SYSTEM_EVENT_SHUTDOWN
+                    // A guest shutdown or reboot surfaces as VcpuExit::SystemEvent:
+                    // PSCI on aarch64, the SBI SRST extension on riscv64.
                     if event_type == KVM_SYSTEM_EVENT_RESET {
                         Ok(cpu::VmExit::Reset)
                     } else if event_type == KVM_SYSTEM_EVENT_SHUTDOWN {
@@ -2414,6 +2541,71 @@ impl cpu::Vcpu for KvmVcpu {
                 VcpuExit::Unsupported(KVM_EXIT_TDX) => Ok(cpu::VmExit::Tdx),
                 VcpuExit::Debug(_) => Ok(cpu::VmExit::Debug),
 
+                // KVM forwards the SBI calls it cannot service itself (the
+                // debug console, the legacy v0.1 console, and probes of
+                // experimental/vendor extensions) to user space as
+                // KVM_EXIT_RISCV_SBI. kvm-ioctls has no variant for it, so it
+                // arrives as Unsupported(35); the payload lives in the kvm_run
+                // page captured above. The dispatch itself lives in vmm because
+                // the console writes are routed to the serial device on the
+                // MMIO bus, whose address hypervisor cannot know.
+                #[cfg(target_arch = "riscv64")]
+                VcpuExit::Unsupported(kvm_bindings::KVM_EXIT_RISCV_SBI) => {
+                    // SAFETY: `krun` is the kvm_run page kvm-ioctls mmap'd for
+                    // this vCPU fd; it stays mapped for the fd's lifetime and
+                    // this vCPU's thread is the only accessor.
+                    let sbi = unsafe { &(*krun).__bindgen_anon_1.riscv_sbi };
+
+                    Ok(cpu::VmExit::RiscvSbi(cpu::RiscvSbiExitDetails {
+                        extension_id: sbi.extension_id,
+                        function_id: sbi.function_id,
+                        args: sbi.args,
+                    }))
+                }
+
+                // KVM emulates no Zkr CSR in the kernel: a guest access to the
+                // `seed` register exits to user space as KVM_EXIT_RISCV_CSR
+                // (Unsupported(36)). Fill in ret_value with 16 bits of host
+                // entropy tagged ES16, or DEAD if the entropy source fails, and
+                // re-enter KVM_RUN, which installs the value into rd and
+                // advances sepc. Any other CSR number stays a hard error.
+                #[cfg(target_arch = "riscv64")]
+                VcpuExit::Unsupported(kvm_bindings::KVM_EXIT_RISCV_CSR) => {
+                    // SAFETY: `krun` is the kvm_run page for this vCPU fd, and
+                    // this vCPU's thread is the only accessor.
+                    let csr = unsafe { &mut (*krun).__bindgen_anon_1.riscv_csr };
+
+                    if csr.csr_num != CSR_SEED {
+                        return Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                            "Unexpected CSR exit on vcpu run: csr_num={:#x}",
+                            csr.csr_num
+                        )));
+                    }
+
+                    // `new_value` and `write_mask` are deliberately unused: a
+                    // `seed` access is a request for entropy, and the value the
+                    // guest reads back is the fresh OPST-tagged sample rather
+                    // than any prior CSR contents.
+                    let mut entropy = [0u8; 2];
+                    // The fork builds against getrandom 0.2 only transitively;
+                    // call the getrandom(2) syscall through libc (already a
+                    // dependency) so this adds no crate to Cargo.lock.
+                    let ret = unsafe {
+                        libc::getrandom(entropy.as_mut_ptr() as *mut libc::c_void, entropy.len(), 0)
+                    };
+                    csr.ret_value = if ret == entropy.len() as libc::ssize_t {
+                        u64::from(u16::from_ne_bytes(entropy)) | SEED_OPST_ES16
+                    } else {
+                        error!(
+                            "Host entropy source failed for the seed CSR: {}",
+                            std::io::Error::last_os_error()
+                        );
+                        SEED_OPST_DEAD
+                    };
+
+                    Ok(cpu::VmExit::Ignore)
+                }
+
                 r => Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
                     "Unexpected exit reason on vcpu run: {:?}",
                     r
@@ -2428,6 +2620,22 @@ impl cpu::Vcpu for KvmVcpu {
                 ))),
             },
         }
+    }
+
+    ///
+    /// Set the return values of an SBI call KVM forwarded to user space. KVM
+    /// copies them into the guest's `a0`/`a1` and advances `sepc` when the vCPU
+    /// resumes, so the caller must do neither itself.
+    ///
+    #[cfg(target_arch = "riscv64")]
+    fn set_riscv_sbi_ret(&self, ret0: u64, ret1: u64) {
+        let mut fd = self.fd.lock().unwrap();
+        let kvm_run = fd.get_kvm_run();
+        // SAFETY: accessing a union field in a valid structure
+        let sbi = unsafe { &mut kvm_run.__bindgen_anon_1.riscv_sbi };
+
+        sbi.ret[0] = ret0;
+        sbi.ret[1] = ret1;
     }
     #[cfg(target_arch = "x86_64")]
     ///
@@ -2884,14 +3092,8 @@ impl cpu::Vcpu for KvmVcpu {
 
         // Get non-core register
         // Call KVM_GET_REG_LIST to get all registers available to the guest.
-        // For RISC-V 64-bit there are around 200 registers.
         let mut sys_regs: Vec<kvm_bindings::kvm_one_reg> = Vec::new();
-        let mut reg_list = kvm_bindings::RegList::new(200).unwrap();
-        self.fd
-            .lock()
-            .unwrap()
-            .get_reg_list(&mut reg_list)
-            .map_err(|e| cpu::HypervisorCpuError::GetRegList(e.into()))?;
+        let reg_list = riscv_reg_list(&self.fd.lock().unwrap())?;
 
         // At this point reg_list should contain:
         // - core registers
@@ -2899,6 +3101,9 @@ impl cpu::Vcpu for KvmVcpu {
         // - timer registers
         // - control and status registers
         // - AIA control and status registers
+        // - floating point registers
+        // - vector registers
+        // - ISA extension registers
         // - smstateen control and status registers
         // - sbi_sta control and status registers.
         //
@@ -2907,11 +3112,13 @@ impl cpu::Vcpu for KvmVcpu {
         // all of them. We carve out from the list the core registers which are
         // represented in the kernel by `kvm_riscv_core` structure and for which
         // we can calculate the id based on the offset in the structure.
-        reg_list.retain(|regid| is_non_core_register(*regid));
+        let indices: Vec<u64> = reg_list
+            .into_iter()
+            .filter(|regid| is_non_core_register(*regid))
+            .collect();
 
         // Now, for the rest of the registers left in the previously fetched
         // register list, we are simply calling KVM_GET_ONE_REG.
-        let indices = reg_list.as_slice();
         for index in indices.iter() {
             let mut bytes = [0_u8; 8];
             self.fd
@@ -3043,11 +3250,25 @@ impl cpu::Vcpu for KvmVcpu {
     /// Restore the previously saved RISC-V 64-bit CPU state
     ///
     fn set_state(&self, state: &CpuState) -> cpu::Result<()> {
+        use kvm_bindings::{kvm_riscv_timer, KVM_REG_RISCV_TIMER, KVM_RISCV_TIMER_STATE_OFF};
+
+        let state_offset = offset_of!(kvm_riscv_timer, state);
+        let timer_state_id = riscv64_reg_id!(KVM_REG_RISCV_TIMER, state_offset);
+
         let state: VcpuKvmState = state.clone().into();
         // Set core registers
         self.set_regs(&state.core_regs.into())?;
         // Set system registers
         for reg in &state.non_core_regs {
+            // KVM routes a write of `TIMER_REG(state)` to
+            // `kvm_riscv_vcpu_timer_cancel()`, which fails with -EINVAL unless a
+            // timer event is pending. The getter reports OFF whenever the timer
+            // has already expired, and a vCPU being restored into never has one
+            // armed, so replaying OFF can only fail. Skipping it leaves the
+            // timer disarmed, which is what OFF means; QEMU skips it too.
+            if reg.id == timer_state_id && reg.addr == u64::from(KVM_RISCV_TIMER_STATE_OFF) {
+                continue;
+            }
             self.fd
                 .lock()
                 .unwrap()

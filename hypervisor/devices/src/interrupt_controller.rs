@@ -33,6 +33,9 @@ pub enum Error {
     #[cfg(target_arch = "riscv64")]
     /// Failed restoring AIA device.
     RestoreAia(hypervisor::arch::riscv64::aia::Error),
+    #[cfg(target_arch = "riscv64")]
+    /// Failed deasserting the interrupt.
+    DeassertInterrupt(hypervisor::HypervisorVmError),
 }
 
 type Result<T> = result::Result<T, Error>;
@@ -62,6 +65,11 @@ pub struct MsiMessage {
 // IOAPIC (X86), GIC (Arm) or AIA (RISC-V).
 pub trait InterruptController: Send {
     fn service_irq(&mut self, irq: usize) -> Result<()>;
+    // Lower the controller input for `irq`. Controllers that latch the level of
+    // their inputs need this, so a device can tell them it has nothing pending.
+    fn deassert_irq(&mut self, _irq: usize) -> Result<()> {
+        Ok(())
+    }
     #[cfg(target_arch = "aarch64")]
     fn enable(&self) -> Result<()>;
     #[cfg(target_arch = "x86_64")]

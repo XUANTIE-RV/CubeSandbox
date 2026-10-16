@@ -133,6 +133,14 @@ pub trait InterruptSourceGroup: Send + Sync {
     /// Inject an interrupt from this interrupt source into the guest.
     fn trigger(&self, index: InterruptIndex) -> Result<()>;
 
+    /// Lower the interrupt line of a source that has nothing left pending.
+    fn deassert(&self, _index: InterruptIndex) -> Result<()> {
+        // Only level triggered sources routed through an in-kernel interrupt
+        // controller have a line that user space can lower.
+        // To accommodate this, we can have a no-op here.
+        Ok(())
+    }
+
     /// Returns an interrupt notifier from this interrupt.
     ///
     /// An interrupt notifier allows for external components and processes

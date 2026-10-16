@@ -8,15 +8,16 @@ extern crate arch;
 use std::result;
 use std::sync::{Arc, Mutex};
 
+use anyhow::anyhow;
 use arch::layout;
 use hypervisor::arch::riscv64::aia::{Vaia, VaiaConfig};
-use hypervisor::{AiaState, CpuState};
+use hypervisor::AiaState;
 use vm_device::interrupt::{
     InterruptIndex, InterruptManager, InterruptSourceConfig, InterruptSourceGroup,
     LegacyIrqSourceConfig, MsiIrqGroupConfig,
 };
 use vm_memory::address::Address;
-use vm_migration::{Migratable, Pausable, Snapshottable, Transportable};
+use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 
 type Result<T> = result::Result<T, Error>;
@@ -24,8 +25,7 @@ type Result<T> = result::Result<T, Error>;
 // Reserve 32 IRQs for legacy devices.
 pub const IRQ_LEGACY_BASE: usize = layout::IRQ_BASE as usize;
 pub const IRQ_LEGACY_COUNT: usize = 32;
-// TODO: AIA snapshotting is not yet completed.
-pub const _AIA_SNAPSHOT_ID: &str = "";
+pub const AIA_SNAPSHOT_ID: &str = "aia";
 
 // Aia (Advance Interrupt Architecture) struct provides all the functionality of a
 // AIA device. It wraps a hypervisor-emulated AIA device (Vaia) provided by the
@@ -36,6 +36,7 @@ pub struct Aia {
     interrupt_source_group: Arc<dyn InterruptSourceGroup>,
     // The hypervisor agnostic virtual AIA
     vaia: Arc<Mutex<dyn Vaia>>,
+    vm: Arc<dyn hypervisor::Vm>,
 }
 
 impl Aia {
@@ -58,22 +59,18 @@ impl Aia {
         let aia = Aia {
             interrupt_source_group,
             vaia,
+            vm,
         };
         aia.enable()?;
 
         Ok(aia)
     }
 
-    pub fn restore_vaia(
-        &mut self,
-        state: Option<AiaState>,
-        _saved_vcpu_states: &[CpuState],
-    ) -> Result<()> {
+    pub fn restore_vaia(&self, state: &AiaState) -> Result<()> {
         self.vaia
-            .clone()
             .lock()
             .unwrap()
-            .set_state(&state.unwrap())
+            .set_state(state)
             .map_err(Error::RestoreAia)
     }
 
@@ -129,12 +126,34 @@ impl InterruptController for Aia {
         Ok(())
     }
 
+    // The in-kernel APLIC latches the input level of every assert, and a level
+    // triggered source stays eligible for re-delivery until that latch is
+    // cleared. Nothing the guest does to the APLIC clears it, so the device has
+    // to.
+    fn deassert_irq(&mut self, irq: usize) -> Result<()> {
+        self.vm
+            .set_irq_line(irq as u32, false)
+            .map_err(Error::DeassertInterrupt)
+    }
+
     fn notifier(&self, irq: usize) -> Option<EventFd> {
         self.interrupt_source_group.notifier(irq as InterruptIndex)
     }
 }
 
-impl Snapshottable for Aia {}
+impl Snapshottable for Aia {
+    fn id(&self) -> String {
+        AIA_SNAPSHOT_ID.to_string()
+    }
+
+    fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
+        let state =
+            self.vaia.lock().unwrap().state().map_err(|e| {
+                MigratableError::Snapshot(anyhow!("Could not save the AIA state: {e}"))
+            })?;
+        Snapshot::new_from_state(&self.id(), &state)
+    }
+}
 impl Pausable for Aia {}
 impl Transportable for Aia {}
 impl Migratable for Aia {}

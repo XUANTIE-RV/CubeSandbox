@@ -264,6 +264,16 @@ pub enum HypervisorCpuError {
     InitializePmu,
 }
 
+/// An SBI call KVM forwarded to user space (`KVM_EXIT_RISCV_SBI`). The field
+/// names mirror `kvm_run::riscv_sbi` in the kernel uapi.
+#[cfg(target_arch = "riscv64")]
+#[derive(Clone, Copy, Debug)]
+pub struct RiscvSbiExitDetails {
+    pub extension_id: u64,
+    pub function_id: u64,
+    pub args: [u64; 6],
+}
+
 #[derive(Debug)]
 pub enum VmExit {
     #[cfg(target_arch = "x86_64")]
@@ -276,6 +286,8 @@ pub enum VmExit {
     Tdx,
     #[cfg(feature = "kvm")]
     Debug,
+    #[cfg(target_arch = "riscv64")]
+    RiscvSbi(RiscvSbiExitDetails),
 }
 
 ///
@@ -457,6 +469,13 @@ pub trait Vcpu: Send + Sync {
     fn set_tdx_status(&mut self, _status: TdxExitStatus) {
         unimplemented!()
     }
+    #[cfg(target_arch = "riscv64")]
+    ///
+    /// Set the error and value a forwarded SBI call returns to the guest. KVM
+    /// copies them into `a0`/`a1` and advances `sepc` when the vCPU resumes,
+    /// so the caller must not do either itself.
+    ///
+    fn set_riscv_sbi_ret(&self, _ret0: u64, _ret1: u64) {}
     #[cfg(target_arch = "x86_64")]
     ///
     /// Return the list of initial MSR entries for a VCPU

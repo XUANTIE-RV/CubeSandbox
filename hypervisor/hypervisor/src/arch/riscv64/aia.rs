@@ -7,7 +7,7 @@ use std::result;
 
 use thiserror::Error;
 
-use crate::{AiaState, HypervisorDeviceError, HypervisorVmError};
+use crate::{AiaSnapshotConfig, AiaState, HypervisorDeviceError, HypervisorVmError};
 
 /// Errors thrown while setting up the VAIA.
 #[derive(Debug, Error)]
@@ -21,6 +21,14 @@ pub enum Error {
     /// Error while getting device attributes for the AIA.
     #[error("Failed getting device attributes for the AIA: {0}")]
     GetDeviceAttribute(HypervisorDeviceError),
+    /// The saved state belongs to a differently configured AIA.
+    #[error("Saved AIA state is for {saved:?}, this AIA is {current:?}")]
+    IncompatibleState {
+        /// Configuration the state was read under.
+        saved: AiaSnapshotConfig,
+        /// Configuration of the AIA the state is being restored into.
+        current: AiaSnapshotConfig,
+    },
 }
 pub type Result<T> = result::Result<T, Error>;
 

@@ -1515,9 +1515,19 @@ impl DeviceManager {
         ));
 
         self.interrupt_controller = Some(interrupt_controller.clone());
-        let id = String::from(aia::_AIA_SNAPSHOT_ID);
-        if snapshot_from_id(self.snapshot.as_ref(), id.as_str()).is_some() {
-            unimplemented!("RISC-V AIA snapshot restore is not implemented")
+        let id = String::from(aia::AIA_SNAPSHOT_ID);
+        if let Some(vaia_snapshot) = snapshot_from_id(self.snapshot.as_ref(), id.as_str()) {
+            // TODO: PMU support is scheduled to next stage of riscv64 support.
+            // PMU support is optional. Nothing should be impacted if the PMU
+            // initialization failed.
+            let vaia_state = vaia_snapshot
+                .to_state(id.as_str())
+                .map_err(DeviceManagerError::RestoreGetState)?;
+            interrupt_controller
+                .lock()
+                .unwrap()
+                .restore_vaia(&vaia_state)
+                .map_err(DeviceManagerError::CreateInterruptController)?;
         }
         self.device_tree
             .lock()

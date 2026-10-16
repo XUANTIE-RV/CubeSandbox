@@ -213,7 +213,20 @@ impl InterruptSourceGroup for LegacyUserspaceInterruptGroup {
             .map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::Other,
-                    format!("failed to inject IRQ #{}: {:?}", self.irq, e),
+                    format!("Failed to inject IRQ #{}: {:?}", self.irq, e),
+                )
+            })
+    }
+
+    fn deassert(&self, _index: InterruptIndex) -> Result<()> {
+        self.ioapic
+            .lock()
+            .unwrap()
+            .deassert_irq(self.irq as usize)
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Failed to deassert IRQ #{}: {:?}", self.irq, e),
                 )
             })
     }

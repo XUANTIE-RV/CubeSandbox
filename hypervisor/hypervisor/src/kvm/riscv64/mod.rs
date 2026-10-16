@@ -115,6 +115,10 @@ macro_rules! riscv64_reg_id {
 
 /// Specifies whether a particular register is a core register or not.
 ///
+/// Registers that are neither core nor 64-bit wide are reported as core, i.e.
+/// left out of the saved list: the caller reads every id it keeps with
+/// `KVM_GET_ONE_REG` into an 8-byte buffer, which only fits a U64 register.
+///
 /// # Arguments
 ///
 /// * `regid` - The index of the register we are checking.
@@ -125,10 +129,14 @@ pub fn is_non_core_register(regid: u64) -> bool {
 
     let size = regid & KVM_REG_SIZE_MASK;
 
-    assert!(
-        size == KVM_REG_SIZE_U64,
-        "Unexpected register size for system register {size}"
-    );
+    // Not every non-core register is 64-bit wide. `KVM_REG_RISCV_FP_F` covers
+    // 32 single-precision registers plus fcsr, `KVM_REG_RISCV_FP_D` has a
+    // 32-bit fcsr of its own, and the vector registers are sized from `vlenb`
+    // and so wider than any buffer we could read them into. Leave those out
+    // rather than truncating or overrunning the 8-byte read the caller does.
+    if size != KVM_REG_SIZE_U64 {
+        return false;
+    }
 
     true
 }

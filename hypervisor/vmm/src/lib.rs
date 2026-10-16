@@ -691,11 +691,9 @@ impl Vmm {
         &mut self,
         snapshot_config: &SnapshotConfig,
     ) -> result::Result<(), VmError> {
-        #[cfg(target_arch = "riscv64")]
-        return Err(VmError::Riscv64Unsupported(
-            "pause-to-snapshot requires vAIA state migration",
-        ));
-
+        // riscv64 vAIA state migration is implemented (0008 register list,
+        // 0009 AIA save/restore, 0010 disarmed-timer skip), so pause-to-snapshot
+        // is no longer gated off on riscv64.
         self.vm_pause()?;
         self.vm_snapshot(snapshot_config)?;
         self.vm_delete()
@@ -717,12 +715,8 @@ impl Vmm {
     }
 
     fn vm_snapshot(&mut self, snapshot_config: &SnapshotConfig) -> result::Result<(), VmError> {
-        #[cfg(target_arch = "riscv64")]
-        return Err(VmError::Riscv64Unsupported(
-            "snapshot requires vAIA state migration",
-        ));
-
-        #[cfg(not(target_arch = "riscv64"))]
+        // riscv64 vAIA state migration is implemented (0009): the AIA device is
+        // part of the device_tree snapshot, so vm.snapshot()/send() work here too.
         if let Some(ref mut vm) = self.vm {
             vm.snapshot()
                 .map_err(VmError::Snapshot)
@@ -736,11 +730,8 @@ impl Vmm {
     }
 
     fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> result::Result<(), VmError> {
-        #[cfg(target_arch = "riscv64")]
-        return Err(VmError::Riscv64Unsupported(
-            "restore requires vAIA state migration",
-        ));
-
+        // riscv64 vAIA state migration is implemented (0009 + device_manager
+        // restore_vaia), so restore is no longer gated off on riscv64.
         if self.vm.is_some() || self.vm_config.is_some() {
             return Err(VmError::VmAlreadyCreated);
         }

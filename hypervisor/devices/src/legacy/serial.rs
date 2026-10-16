@@ -157,20 +157,29 @@ impl Serial {
         (self.modem_control & MCR_LOOP_BIT) != 0
     }
 
+    fn is_intr_pending(&self, bit: u8) -> bool {
+        (self.interrupt_identification & bit) != 0
+    }
+
     fn add_intr_bit(&mut self, bit: u8) {
         self.interrupt_identification &= !IIR_NONE_BIT;
         self.interrupt_identification |= bit;
     }
 
-    fn del_intr_bit(&mut self, bit: u8) {
+    fn del_intr_bit(&mut self, bit: u8) -> Result<()> {
         self.interrupt_identification &= !bit;
         if self.interrupt_identification == 0x0 {
             self.interrupt_identification = IIR_NONE_BIT;
+            self.deassert_interrupt()?;
         }
+        Ok(())
     }
 
+    // The interrupt line is latched in interrupt_identification until the guest reads IIR, so an
+    // already pending source must not emit another edge: the guest would service both with a
+    // single IIR read and count the surplus interrupts as unhandled.
     fn thr_empty(&mut self) -> Result<()> {
-        if self.is_thr_intr_enabled() {
+        if self.is_thr_intr_enabled() && !self.is_intr_pending(IIR_THR_BIT) {
             self.add_intr_bit(IIR_THR_BIT);
             self.trigger_interrupt()?
         }
@@ -178,7 +187,7 @@ impl Serial {
     }
 
     fn recv_data(&mut self) -> Result<()> {
-        if self.is_recv_intr_enabled() {
+        if self.is_recv_intr_enabled() && !self.is_intr_pending(IIR_RECV_BIT) {
             self.add_intr_bit(IIR_RECV_BIT);
             self.trigger_interrupt()?
         }
@@ -190,8 +199,17 @@ impl Serial {
         self.interrupt.trigger(0)
     }
 
-    fn iir_reset(&mut self) {
+    // The line is level triggered, so the controller keeps re-delivering the
+    // interrupt until the device lowers it. The guest cannot do that on the
+    // device's behalf: reading IIR is what tells the device it has been served.
+    fn deassert_interrupt(&self) -> io::Result<()> {
+        self.interrupt.deassert(0)
+    }
+
+    fn iir_reset(&mut self) -> Result<()> {
         self.interrupt_identification = DEFAULT_INTERRUPT_IDENTIFICATION;
+        self.deassert_interrupt()?;
+        Ok(())
     }
 
     fn handle_write(&mut self, offset: u8, v: u8) -> Result<()> {
@@ -262,7 +280,9 @@ impl BusDevice for Serial {
             DLAB_LOW if self.is_dlab_set() => self.baud_divisor as u8,
             DLAB_HIGH if self.is_dlab_set() => (self.baud_divisor >> 8) as u8,
             DATA => {
-                self.del_intr_bit(IIR_RECV_BIT);
+                if let Err(e) = self.del_intr_bit(IIR_RECV_BIT) {
+                    error!("Failed to deassert the serial interrupt: {e}");
+                }
                 if self.in_buffer.len() <= 1 {
                     self.line_status &= !LSR_DATA_BIT;
                 }
@@ -271,7 +291,9 @@ impl BusDevice for Serial {
             IER => self.interrupt_enable,
             IIR => {
                 let v = self.interrupt_identification | IIR_FIFO_BITS;
-                self.iir_reset();
+                if let Err(e) = self.iir_reset() {
+                    error!("Failed to deassert the serial interrupt: {e}");
+                }
                 v
             }
             LCR => self.line_control,

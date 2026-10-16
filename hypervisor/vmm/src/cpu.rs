@@ -89,6 +89,121 @@ use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::{register_signal_handler, SIGRTMIN};
 use zerocopy::AsBytes;
 
+/// The SBI calls KVM forwards to user space, and how to answer them.
+///
+/// KVM only forwards what it cannot service itself: the debug console, the
+/// legacy v0.1 console, a base-extension probe of an experimental or vendor
+/// extension, and calls to those extensions. The console calls are routed to
+/// the legacy serial device on the MMIO bus; everything else is reported
+/// unsupported, which the SBI specification defines as the answer for an
+/// extension the implementation does not provide.
+#[cfg(target_arch = "riscv64")]
+mod riscv_sbi {
+    use arch::layout;
+    use hypervisor::{RiscvSbiExitDetails, VmOps};
+    use log::{debug, warn};
+
+    // Extension and function ids from the RISC-V SBI specification, matching
+    // the kernel's arch/riscv/include/asm/sbi.h.
+    const SUCCESS: u64 = 0;
+    const ERR_NOT_SUPPORTED: u64 = -2i64 as u64;
+
+    const EXT_0_1_CONSOLE_PUTCHAR: u64 = 0x1;
+    const EXT_0_1_CONSOLE_GETCHAR: u64 = 0x2;
+    const EXT_BASE: u64 = 0x10;
+    const EXT_DBCN: u64 = 0x4442_434e; // "DBCN"
+
+    const FID_BASE_PROBE_EXT: u64 = 3;
+    const FID_DBCN_CONSOLE_WRITE: u64 = 0;
+    const FID_DBCN_CONSOLE_READ: u64 = 1;
+    const FID_DBCN_CONSOLE_WRITE_BYTE: u64 = 2;
+
+    /// The byte count of a debug-console write comes from the guest, so the
+    /// data is copied out in bounded chunks rather than into a buffer sized
+    /// from it.
+    const WRITE_CHUNK: usize = 4096;
+
+    /// Service one forwarded SBI call, returning the pair KVM writes back into
+    /// the guest's `a0` and `a1`. KVM advances `sepc` itself.
+    pub fn handle(details: RiscvSbiExitDetails, vm_ops: &dyn VmOps) -> (u64, u64) {
+        let serial = layout::LEGACY_SERIAL_MAPPED_IO_START.0;
+        let args = details.args;
+
+        debug!(
+            "Forwarded SBI call: extension_id={:#x} function_id={:#x} args={args:#x?}",
+            details.extension_id, details.function_id
+        );
+
+        match (details.extension_id, details.function_id) {
+            (EXT_DBCN, FID_DBCN_CONSOLE_WRITE) => {
+                let written = write_range(vm_ops, serial, args[1], args[0]);
+                (SUCCESS, written)
+            }
+            (EXT_DBCN, FID_DBCN_CONSOLE_WRITE_BYTE) => {
+                write_byte(vm_ops, serial, args[0] as u8);
+                (SUCCESS, 0)
+            }
+            // There is no console input to hand back. Reading zero bytes is a
+            // successful empty read for DBCN; the legacy call reports "no
+            // character" with -1 instead.
+            (EXT_DBCN, FID_DBCN_CONSOLE_READ) => (SUCCESS, 0),
+            (EXT_0_1_CONSOLE_PUTCHAR, _) => {
+                write_byte(vm_ops, serial, args[0] as u8);
+                (SUCCESS, 0)
+            }
+            (EXT_0_1_CONSOLE_GETCHAR, _) => (-1i64 as u64, 0),
+            // KVM forwards a probe only when its target is an experimental or
+            // vendor extension, and neither is implemented here. The value is
+            // what the guest reads as "available", so zero means it is not.
+            (EXT_BASE, FID_BASE_PROBE_EXT) => (SUCCESS, 0),
+            _ => {
+                warn!(
+                    "Unsupported SBI call: extension_id={:#x} function_id={:#x}",
+                    details.extension_id, details.function_id
+                );
+                (ERR_NOT_SUPPORTED, 0)
+            }
+        }
+    }
+
+    fn write_byte(vm_ops: &dyn VmOps, serial: u64, byte: u8) {
+        // The serial device only accepts single-byte accesses.
+        if let Err(e) = vm_ops.mmio_write(serial, &[byte]) {
+            warn!("Failed to write an SBI console byte: {e}");
+        }
+    }
+
+    /// Copy `num_bytes` of guest memory at `address` to the serial device,
+    /// returning how many bytes reached it.
+    fn write_range(vm_ops: &dyn VmOps, serial: u64, address: u64, num_bytes: u64) -> u64 {
+        let mut buffer = [0u8; WRITE_CHUNK];
+        let mut remaining = num_bytes;
+        let mut offset = 0;
+        let mut written = 0;
+
+        while remaining > 0 {
+            let chunk_len = remaining.min(WRITE_CHUNK as u64) as usize;
+            let chunk = &mut buffer[..chunk_len];
+
+            match vm_ops.guest_mem_read(address + offset, chunk) {
+                Ok(len) if len > 0 => {
+                    for byte in &chunk[..len] {
+                        write_byte(vm_ops, serial, *byte);
+                    }
+                    written += len as u64;
+                    offset += len as u64;
+                    remaining -= len as u64;
+                }
+                // A short or failed read means the rest of the range is not
+                // backed by guest memory. Report what did get out.
+                _ => break,
+            }
+        }
+
+        written
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
 /// Extract the specified bits of a 64-bit integer.
 /// For example, to extrace 2 bits from offset 1 (zero based) of `6u64`,
@@ -876,14 +991,13 @@ impl CpuManager {
             // AArch64 vCPUs should be initialized after created.
             #[cfg(target_arch = "aarch64")]
             vcpu.init(&self.vm)?;
-            #[cfg(target_arch = "riscv64")]
-            {
-                let _ = snapshot;
-                return Err(Error::StartRestoreVcpu(anyhow!(
-                    "RISC-V vCPU snapshot restore is not implemented"
-                )));
-            }
-            #[cfg(not(target_arch = "riscv64"))]
+            // On riscv64 `Vcpu::restore` -> `KvmVcpu::set_state` writes the core
+            // registers plus every non-core register (CONFIG/TIMER/ISA_EXT/
+            // SBI_EXT/CSR/FP/...) back over the KVM-sized register list, exactly
+            // mirroring the save-side `state()`, and skips a disarmed timer
+            // (patch 0010). No extra init step is needed: `Vcpu::new` already
+            // ran KVM_CREATE_VCPU, which also allocates the AIA guest interrupt
+            // file for this hart.
             vcpu.restore(snapshot).expect("Failed to restore vCPU");
         } else {
             #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
@@ -986,6 +1100,12 @@ impl CpuManager {
 
         #[cfg(target_arch = "x86_64")]
         let interrupt_controller_clone = self.interrupt_controller.as_ref().cloned();
+
+        // The vCPU thread body runs inside panic::catch_unwind, which needs its
+        // captures to be UnwindSafe. VmOps has no RefUnwindSafe bound, so the
+        // handle is asserted here as vmm's other catch_unwind sites do.
+        #[cfg(target_arch = "riscv64")]
+        let vm_ops_clone = std::panic::AssertUnwindSafe(self.vm_ops.clone());
 
         info!("Starting vCPU: cpu_id = {}", vcpu_id);
 
@@ -1145,6 +1265,12 @@ impl CpuManager {
                                             // is wrong.
                                             unreachable!("Couldn't get a mutable reference from Arc<dyn Vcpu> as there are multiple instances");
                                         }
+                                    }
+                                    #[cfg(target_arch = "riscv64")]
+                                    VmExit::RiscvSbi(details) => {
+                                        let (ret0, ret1) =
+                                            riscv_sbi::handle(details, &**vm_ops_clone);
+                                        vcpu.vcpu.set_riscv_sbi_ret(ret0, ret1);
                                     }
                                 },
 
@@ -2209,9 +2335,31 @@ impl Snapshottable for CpuManager {
 
     fn restore(&mut self, snapshot: Snapshot) -> std::result::Result<(), MigratableError> {
         for (cpu_id, snapshot) in snapshot.snapshots.iter() {
+            let cpu_id = cpu_id.parse::<u8>().unwrap();
             info!("Restoring VCPU {}", cpu_id);
-            self.create_vcpu(cpu_id.parse::<u8>().unwrap(), None, Some(*snapshot.clone()))
-                .map_err(|e| MigratableError::Restore(anyhow!("Could not create vCPU {:?}", e)))?;
+            // On riscv64 the boot vCPUs (and their KVM AIA guest interrupt
+            // files) are created eagerly in `Vm::new` via `create_boot_vcpus`,
+            // so a vCPU with this id already exists. Restore the state into the
+            // existing vCPU instead of issuing a second `KVM_CREATE_VCPU`, which
+            // fails with EEXIST (os error 17). On x86_64/aarch64 `self.vcpus` is
+            // empty at this point, so the create path below still runs and each
+            // vCPU is created exactly once. A cpu_id beyond the eagerly created
+            // set (e.g. a vCPU hot-added before the snapshot) also falls through
+            // to `create_vcpu`.
+            if (cpu_id as usize) < self.vcpus.len() {
+                self.vcpus[cpu_id as usize]
+                    .lock()
+                    .unwrap()
+                    .restore(*snapshot.clone())
+                    .map_err(|e| {
+                        MigratableError::Restore(anyhow!("Could not restore vCPU {:?}", e))
+                    })?;
+            } else {
+                self.create_vcpu(cpu_id, None, Some(*snapshot.clone()))
+                    .map_err(|e| {
+                        MigratableError::Restore(anyhow!("Could not create vCPU {:?}", e))
+                    })?;
+            }
         }
 
         // Reset tsc msrs for all vcpu, so that KVM could synchronize TSC
@@ -2938,5 +3086,31 @@ mod tests {
         // all, so it must never retry.
         let other = hypervisor::HypervisorCpuError::RunVcpu(anyhow::anyhow!("unrelated"));
         assert!(!should_retry_without_pmu(&other));
+    }
+}
+
+#[cfg(all(feature = "kvm", target_arch = "riscv64"))]
+#[cfg(test)]
+mod tests {
+    // Round-trip the full riscv64 vCPU state through the same
+    // `state()`/`set_state()` pair the snapshot SAVE and RESTORE paths use.
+    // `state()` reads the core registers plus every non-core register over the
+    // KVM-sized register list (patch 0008); `set_state()` writes them back and
+    // skips a disarmed timer (patch 0010). This mirrors the AIA round-trip test
+    // and guards the restore glue added in `create_vcpu`/`CpuManager::restore`.
+    #[test]
+    fn test_save_restore_vcpu_state() {
+        let hv = hypervisor::new().unwrap();
+        let vm = hv.create_vm().unwrap();
+        let vcpu = vm.create_vcpu(0, None).unwrap();
+
+        let state = vcpu.state().expect("failed to save riscv64 vCPU state");
+        vcpu.set_state(&state)
+            .expect("failed to restore riscv64 vCPU state");
+
+        // A second read must still succeed, proving set_state left the vCPU in
+        // a valid state rather than one KVM rejects.
+        vcpu.state()
+            .expect("failed to re-read riscv64 vCPU state after restore");
     }
 }

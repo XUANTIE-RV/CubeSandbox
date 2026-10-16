@@ -51,13 +51,15 @@ mod cpu;
 /// Device related module
 mod device;
 
+#[cfg(target_arch = "riscv64")]
+pub use cpu::RiscvSbiExitDetails;
 pub use cpu::{HypervisorCpuError, Vcpu, VmExit};
 pub use device::HypervisorDeviceError;
 pub use hypervisor::{Hypervisor, HypervisorError};
 #[cfg(all(feature = "kvm", target_arch = "aarch64"))]
 pub use kvm::{aarch64, GicState};
 #[cfg(all(feature = "kvm", target_arch = "riscv64"))]
-pub use kvm::{riscv64, AiaState};
+pub use kvm::{riscv64, AiaSnapshotConfig, AiaState};
 use std::sync::Arc;
 pub use vm::{
     DataMatch, HypervisorVmError, InterruptSourceConfig, LegacyIrqSourceConfig, MsiIrqSourceConfig,
