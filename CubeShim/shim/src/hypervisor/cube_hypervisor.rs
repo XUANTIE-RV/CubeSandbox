@@ -25,17 +25,15 @@ use super::config::PciDeviceInfo;
 const CALLE_ACTION_ADD_DEV_PRE: &str = "AddDevice";
 
 fn ensure_snapshot_supported() -> CResult<()> {
-    #[cfg(target_arch = "riscv64")]
-    {
-        return Err(
-            "RISC-V VM snapshot/restore is unavailable because vAIA state migration is not implemented"
-                .to_string(),
-        );
-    }
-    #[cfg(not(target_arch = "riscv64"))]
-    {
-        Ok(())
-    }
+    // riscv64 snapshot/restore is now supported: the vendored Cloud Hypervisor
+    // fork implements vAIA (APLIC + IMSIC) state save/restore over the KVM AIA
+    // device attributes (KVM_DEV_RISCV_AIA_GRP_APLIC / _IMSIC), so the AIA
+    // round-trips through the snapshot. The former hard error is removed.
+    //
+    // Remaining known gaps, tracked as TODO(port) in the fork: the PMU is not
+    // part of the AIA snapshot, and AIA state that KVM exposes only through the
+    // guest memory window (not a device attribute) is not captured.
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]

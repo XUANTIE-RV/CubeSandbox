@@ -124,7 +124,16 @@ impl SandBox {
             client: None,
             spec: Spec::default(),
             conf: config::Config::default(),
-            ctx: context::with_timeout(1000 * 1000 * 1000 * 3),
+            // Agent ttrpc context timeout. This bounds every agent call made
+            // with self.ctx, including reset_guest()'s SetGuestDateTime/ReseedRandomDev
+            // which are the FIRST calls after an app-snapshot VM restore. On a
+            // just-resumed guest the agent needs a moment to service the vsock
+            // request again, and under emulation (riscv64 TCG, nested KVM) that
+            // routinely exceeds the old 3s, surfacing as
+            // "reset guest time failed: ttrpc err: Receive packet timeout". 30s
+            // still fails fast on a genuinely dead agent while tolerating a slow
+            // post-restore resume.
+            ctx: context::with_timeout(1000 * 1000 * 1000 * 30),
             ch: Some(Arc::new(Mutex::new(ch))),
             containers: Arc::new(Mutex::new(HashMap::new())),
             log,
@@ -393,14 +402,21 @@ impl SandBox {
             if p.placeholder {
                 continue;
             }
-            //let dev_path = p.guest_device_path(i);
-            //let g_mount_point = p.guest_mount_point(i);
+            // riscv64 Linux 6.6 has no FS_DAX (ZONE_DEVICE needs
+            // ARCH_HAS_PTE_DEVMAP, which riscv does not select), so ext4 rejects
+            // the "dax" mount option with EINVAL. Mirror guest-init and mount the
+            // business pmem read-only without dax there; keep dax elsewhere.
+            #[cfg(target_arch = "riscv64")]
+            let pmem_options = vec!["ro".to_string()];
+            #[cfg(not(target_arch = "riscv64"))]
+            let pmem_options = vec!["ro".to_string(), "dax".to_string()];
+
             let ps = agent::Storage {
                 driver: Pmem::driver(),
                 source: Pmem::guest_device_path(i as u32),
                 fstype: p.fs_type.clone(),
                 mount_point: Pmem::guest_mount_point(i as u32),
-                options: vec!["ro".to_string(), "dax".to_string()].into(),
+                options: pmem_options.into(),
                 ..Default::default()
             };
 
@@ -871,29 +887,21 @@ impl SandBox {
     }
 
     fn by_snapshot(&self) -> bool {
-        #[cfg(target_arch = "riscv64")]
-        {
-            return false;
-        }
-
-        #[cfg(not(target_arch = "riscv64"))]
+        // riscv64 vAIA state migration is now implemented (0008 register list,
+        // 0009 AIA save/restore, 0010 disarmed-timer skip are all ported), so
+        // riscv64 uses the same restore-from-snapshot decision as other arches.
         let anno = self.spec.annotations().as_ref().unwrap();
-        #[cfg(not(target_arch = "riscv64"))]
         if anno.contains_key(config::ANNO_SNAPSHOT_DISABLE) {
             return false;
         }
 
-        #[cfg(not(target_arch = "riscv64"))]
         if let Some(proc) = self.spec.process() {
             if proc.selinux_label().is_some() && !proc.selinux_label().clone().unwrap().is_empty() {
                 return false;
             }
         }
 
-        #[cfg(not(target_arch = "riscv64"))]
-        {
-            !self.conf.app_snapshot_create
-        }
+        !self.conf.app_snapshot_create
     }
     async fn start_vm(&mut self) -> CResult<bool> {
         infof!(self.log, "start vm start");
@@ -919,12 +927,6 @@ impl SandBox {
                 }
             }
         } else if self.conf.app_snapshot_restore {
-            #[cfg(target_arch = "riscv64")]
-            return Err(
-                "app snapshot restore is unavailable on riscv64 because vAIA state migration is not implemented"
-                    .to_string(),
-            );
-            #[cfg(not(target_arch = "riscv64"))]
             return Err(
                 "app snapshot restore requested but snapshot is unavailable on this node \
                  (cube.snapshot.disable set or selinux label set)"
@@ -940,7 +942,7 @@ impl SandBox {
             let ch = self.ch.as_mut().unwrap().lock().await;
             let start = Instant::now();
             let ev = ch
-                .wait_notify(Duration::from_nanos(1000 * 1000 * 1000 * 10 as u64))
+                .wait_notify(Duration::from_nanos(1000 * 1000 * 1000 * 300 as u64))
                 .await?;
 
             if CH::NotifyEvent::VsockServerReady != ev {

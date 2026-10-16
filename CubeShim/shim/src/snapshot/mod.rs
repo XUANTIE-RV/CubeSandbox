@@ -18,7 +18,6 @@ use crate::sandbox::pmem::{Pmem, HYP_AGENT_ID, HYP_OS_IMAGE_ID};
 use cube_hypervisor;
 use cube_hypervisor::config::BackendFsConfig;
 
-#[cfg(not(target_arch = "riscv64"))]
 use cube_hypervisor::vmm_config;
 use cube_hypervisor::ApiRequest;
 use cube_hypervisor::SnapshotConfig;
@@ -29,7 +28,6 @@ use hyper::client;
 use hyper_util::rt::TokioIo;
 use std::fs;
 use std::path::{Path, PathBuf};
-#[cfg(not(target_arch = "riscv64"))]
 use std::sync::mpsc::channel;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -103,14 +101,17 @@ impl Snapshot {
 
     #[cfg(target_arch = "riscv64")]
     pub(self) async fn handle(&mut self) -> CResult<()> {
-        Err(
-            "RISC-V VM snapshot creation is unavailable because vAIA state migration is not implemented"
-                .to_string(),
-        )
+        // riscv64 vAIA state migration is now implemented (0008/0009/0010 ported),
+        // so snapshot creation is no longer gated off on riscv64.
+        self.handle_impl().await
     }
 
     #[cfg(not(target_arch = "riscv64"))]
     pub(self) async fn handle(&mut self) -> CResult<()> {
+        self.handle_impl().await
+    }
+
+    async fn handle_impl(&mut self) -> CResult<()> {
         self.check_path()?;
 
         if self.app_snapshot {
@@ -242,14 +243,18 @@ impl Snapshot {
 
     #[cfg(target_arch = "riscv64")]
     fn launch_vmm(&mut self) -> CResult<()> {
-        Err(
-            "RISC-V VM snapshot creation is unavailable because vAIA state migration is not implemented"
-                .to_string(),
-        )
+        // riscv64 vAIA state migration is now implemented (0008 register list,
+        // 0009 AIA save/restore, 0010 disarmed-timer skip are all ported), so
+        // snapshot creation uses the same path as aarch64/x86_64.
+        self.launch_vmm_impl()
     }
 
     #[cfg(not(target_arch = "riscv64"))]
     fn launch_vmm(&mut self) -> CResult<()> {
+        self.launch_vmm_impl()
+    }
+
+    fn launch_vmm_impl(&mut self) -> CResult<()> {
         //launch
         cube_hypervisor::set_runtime_seccomp_rules(vec![
             #[cfg(target_arch = "x86_64")]
