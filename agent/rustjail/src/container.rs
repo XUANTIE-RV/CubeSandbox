@@ -37,7 +37,7 @@ use oci::{ContainerState, LinuxDevice, LinuxIdMapping};
 use oci::{Hook, Linux, LinuxNamespace, LinuxResources, Spec};
 use protobuf::MessageField;
 use protocols::agent::StatsContainerResponse;
-use rlimit::{setrlimit, Resource, Rlim};
+use rlimit::{setrlimit, Resource};
 use slog::{debug, info, o, Logger};
 use tokio::io::AsyncBufReadExt;
 use tokio::sync::Mutex;
@@ -443,11 +443,11 @@ fn do_init_child(cwfd: RawFd) -> Result<()> {
 
     // set rlimit
     for rl in p.rlimits.iter() {
-        setrlimit(
-            Resource::from_str(&rl.r#type)?,
-            Rlim::from_raw(rl.soft),
-            Rlim::from_raw(rl.hard),
-        )?;
+        // rlimit 0.9 setrlimit takes the raw u64 soft/hard bounds directly.
+        // (0.5 wrapped them in Rlim and, on riscv64-musl, omitted NOFILE from
+        // its arch-gated Resource enum, so from_str("RLIMIT_NOFILE") failed and
+        // every container create aborted inside the guest.)
+        setrlimit(Resource::from_str(&rl.r#type)?, rl.soft, rl.hard)?;
     }
 
     //
