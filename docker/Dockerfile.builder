@@ -222,6 +222,15 @@ RUN . /etc/buildenv \
     && cp -r /tmp/protoc/include/* /usr/local/include/ \
     && rm -rf /tmp/protoc /tmp/protoc.zip
 
+# Local build fix (CN network): proxy.golang.org and crates.io are unreachable
+# from this host. Route Go modules via goproxy.cn and cargo crates via rsproxy.cn.
+# Declared as ENV so it applies to BOTH the image build and later `builder-run`
+# steps (docker run inherits image ENV; the Makefile does not override these).
+ENV GOPROXY=https://goproxy.cn,direct \
+    GOSUMDB=sum.golang.google.cn \
+    CARGO_SOURCE_CRATES_IO_REPLACE_WITH=rsproxy-sparse \
+    CARGO_SOURCE_RSPROXY_SPARSE_REGISTRY=sparse+https://rsproxy.cn/index/
+
 RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11 \
     && go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.1 \
     && go install github.com/pseudomuto/protoc-gen-doc/cmd/protoc-gen-doc@v1.5.1
