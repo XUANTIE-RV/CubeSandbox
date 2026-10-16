@@ -16,6 +16,14 @@ MYSQL_CONTAINER="${CUBE_SANDBOX_MYSQL_CONTAINER:-cube-sandbox-mysql}"
 REDIS_CONTAINER="${CUBE_SANDBOX_REDIS_CONTAINER:-cube-sandbox-redis}"
 MINIO_CONTAINER="${CUBE_SANDBOX_MINIO_CONTAINER:-cube-sandbox-minio}"
 MYSQL_IMAGE="${CUBE_SANDBOX_MYSQL_IMAGE:-cube-sandbox-image.tencentcloudcr.com/opensource/mysql:8.0}"
+# MySQL server command args, rendered as a single-line YAML flow sequence so the
+# sed substitution stays line-scoped. Default matches the historical mysql:8.0
+# behaviour. MySQL 8.4 removed --default-authentication-plugin, so riscv64 (which
+# ships a Yocto-built MySQL 8.4 image) overrides this to drop that flag and
+# instead enables mysql_native_password at the server level (see the riscv64
+# MySQL image entrypoint), e.g.:
+#   CUBE_SANDBOX_MYSQL_COMMAND='["--mysql-native-password=ON", "--skip-name-resolve"]'
+MYSQL_COMMAND="${CUBE_SANDBOX_MYSQL_COMMAND:-[\"--default-authentication-plugin=mysql_native_password\", \"--skip-name-resolve\"]}"
 REDIS_IMAGE="${CUBE_SANDBOX_REDIS_IMAGE:-cube-sandbox-image.tencentcloudcr.com/opensource/redis:7-alpine}"
 # Image resolution priority mirrors up-cube-proxy.sh / up-cube-lifecycle-manager.sh:
 #   1. CUBE_SANDBOX_MINIO_IMAGE (explicit operator override)
@@ -69,6 +77,7 @@ render_support_compose() {
       -e "s/__REDIS_CONTAINER__/$(escape_sed "${REDIS_CONTAINER}")/g" \
       -e "s/__MINIO_CONTAINER__/$(escape_sed "${MINIO_CONTAINER}")/g" \
       -e "s#__MYSQL_IMAGE__#$(escape_sed "${MYSQL_IMAGE}" '#')#g" \
+      -e "s#__MYSQL_COMMAND__#$(escape_sed "${MYSQL_COMMAND}" '#')#g" \
       -e "s#__REDIS_IMAGE__#$(escape_sed "${REDIS_IMAGE}" '#')#g" \
       -e "s#__MINIO_IMAGE__#$(escape_sed "${MINIO_IMAGE}" '#')#g" \
       -e "s/__MYSQL_VOLUME__/$(escape_sed "${MYSQL_VOLUME}")/g" \

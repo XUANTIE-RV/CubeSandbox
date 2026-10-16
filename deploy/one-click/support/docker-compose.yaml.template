@@ -11,9 +11,7 @@ services:
       MYSQL_PASSWORD: "__MYSQL_PASSWORD__"
     ports:
       - "127.0.0.1:__MYSQL_PORT__:3306"
-    command:
-      - --default-authentication-plugin=mysql_native_password
-      - --skip-name-resolve
+    command: __MYSQL_COMMAND__
     healthcheck:
       test:
         [

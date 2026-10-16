@@ -131,23 +131,58 @@ kernel_version_ok() {
 # Detect host environment.
 # Sets globals: HOST_ENV (bare-metal | pvm-host | nested-kvm | unknown)
 detect_host_env() {
-  local has_hypervisor_flag=0
-  local has_vmx_or_svm=0
-  local has_kvm_pvm_mod=0
+  local arch has_hypervisor_flag=0 has_native_virt=0 has_kvm_pvm_mod=0 has_kvm_mod=0
 
+  arch="$(uname -m)"
   grep -q 'hypervisor' /proc/cpuinfo 2>/dev/null && has_hypervisor_flag=1
-  grep -qE '\bvmx\b|\bsvm\b' /proc/cpuinfo 2>/dev/null && has_vmx_or_svm=1
   lsmod 2>/dev/null | grep -qE '^kvm_pvm[[:space:]]' && has_kvm_pvm_mod=1
+  lsmod 2>/dev/null | grep -qE '^kvm[[:space:]]' && has_kvm_mod=1
+
+  case "${arch}" in
+    x86_64)
+      # Native virtualization = Intel VMX or AMD-V flags in cpuinfo.
+      grep -qE '\bvmx\b|\bsvm\b' /proc/cpuinfo 2>/dev/null && has_native_virt=1
+      ;;
+    riscv64)
+      # RISC-V H (Hypervisor) extension appears as an 'h' single-letter token
+      # in the base isa string of /proc/cpuinfo (e.g. "rv64imafdcvh"). When the
+      # kernel does not expose isa extensions, fall back to the kvm module +
+      # /dev/kvm as the native-virt signal.
+      local isa_base
+      isa_base="$(awk -F: '/^[[:space:]]*isa[[:space:]]*:/{v=$2; sub(/^[[:space:]]+/,"",v); sub(/[[:space:]_].*/,"",v); print v; exit}' /proc/cpuinfo 2>/dev/null)"
+      if [[ "${isa_base}" == *h* ]]; then
+        has_native_virt=1
+      elif [[ "${has_kvm_mod}" -eq 1 && -e /dev/kvm ]]; then
+        has_native_virt=1
+      fi
+      ;;
+    aarch64)
+      # ARM64 cpuinfo exposes no vmx/svm; use the kvm module + /dev/kvm as the
+      # native-virt signal (EL2/VHE is required for the kvm module to load).
+      if [[ "${has_kvm_mod}" -eq 1 && -e /dev/kvm ]]; then
+        has_native_virt=1
+      fi
+      ;;
+    *)
+      # Unknown arch: best effort via /dev/kvm + kvm module.
+      if [[ "${has_kvm_mod}" -eq 1 && -e /dev/kvm ]]; then
+        has_native_virt=1
+      fi
+      ;;
+  esac
 
   if [[ "${has_kvm_pvm_mod}" -eq 1 ]]; then
-    # kvm_pvm loaded — this is a PVM host (may itself be inside a VM)
+    # kvm_pvm loaded — this is a PVM host (may itself be inside a VM). x86_64-only.
     HOST_ENV="pvm-host"
-  elif [[ "${has_hypervisor_flag}" -eq 0 && "${has_vmx_or_svm}" -eq 1 ]]; then
+  elif [[ "${has_hypervisor_flag}" -eq 0 && "${has_native_virt}" -eq 1 ]]; then
     # No hypervisor flag + native virt extensions → bare-metal
     HOST_ENV="bare-metal"
   elif [[ "${has_hypervisor_flag}" -eq 1 ]]; then
     # Running inside a hypervisor but no kvm_pvm → nested KVM
     HOST_ENV="nested-kvm"
+  elif [[ "${has_native_virt}" -eq 1 ]]; then
+    # Native virt available but cpuinfo reports a hypervisor-less/ambiguous env.
+    HOST_ENV="bare-metal"
   else
     HOST_ENV="unknown"
   fi
@@ -169,22 +204,32 @@ check_virtualization() {
 
   detect_host_env
 
+  # Arch-specific wording for the native-virt signal and the modprobe hint.
+  local arch virt_hint modprobe_hint
+  arch="$(uname -m)"
+  case "${arch}" in
+    x86_64)  virt_hint="native vmx/svm"; modprobe_hint="modprobe kvm_intel (or kvm_amd)" ;;
+    riscv64) virt_hint="RISC-V H-extension"; modprobe_hint="modprobe kvm" ;;
+    aarch64) virt_hint="ARM64 EL2/VHE"; modprobe_hint="modprobe kvm" ;;
+    *)       virt_hint="native virtualization"; modprobe_hint="modprobe kvm" ;;
+  esac
+
   case "${HOST_ENV}" in
 
     bare-metal)
-      pass "host_env" "bare-metal (native vmx/svm, no hypervisor flag)"
+      pass "host_env" "bare-metal (${virt_hint}, no hypervisor flag)"
       # Must have /dev/kvm
       if [[ -e /dev/kvm ]]; then
         pass "dev_kvm" "/dev/kvm present"
       else
-        fail "dev_kvm" "/dev/kvm not found — load kvm module or enable VT-x/AMD-V in BIOS"
+        fail "dev_kvm" "/dev/kvm not found — load the kvm module or enable hardware virtualization (${virt_hint})"
       fi
       # kvm or kvm_intel/kvm_amd module
       if lsmod 2>/dev/null | grep -qE '^kvm[[:space:]]'; then
         local kmod; kmod="$(lsmod 2>/dev/null | grep -oE '^kvm[_a-z]+' | head -1)"
         pass "kmod_kvm" "${kmod} module loaded"
       else
-        fail "kmod_kvm" "kvm module not loaded — run: modprobe kvm_intel (or kvm_amd)"
+        fail "kmod_kvm" "kvm module not loaded — run: ${modprobe_hint}"
       fi
       ;;
 
@@ -219,7 +264,7 @@ check_virtualization() {
 
     *)
       warn "host_env" \
-        "could not determine host environment (no vmx/svm, no hypervisor flag, no kvm_pvm)"
+        "could not determine host environment (no native-virt signal, no hypervisor flag, no kvm_pvm)"
       if [[ -e /dev/kvm ]]; then
         pass "dev_kvm" "/dev/kvm present"
       else

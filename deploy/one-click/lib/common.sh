@@ -444,6 +444,9 @@ validate_cubelet_s3lvol_startup_deps() {
 
   # Release s3lvol_tgt is built for Haswell/AVX2, not the packager's native
   # CPU. Fail here with that wording instead of DPDK's RTE_MACHINE dump.
+  if [[ "$(uname -m)" != "x86_64" ]]; then
+    die "CubeS3lvol (SPDK/DPDK) release binaries are x86_64-only (Haswell/AVX2 baseline); s3lvol is not supported on $(uname -m). Leave it disabled (ONE_CLICK_ENABLE_S3LVOL=0, the default) or build a native s3lvol_tgt for this arch."
+  fi
   if [[ "$(uname -m)" == "x86_64" ]] && ! grep -qw avx2 /proc/cpuinfo; then
     die "CubeS3lvol release binaries require AVX2 (Haswell baseline). This CPU does not advertise avx2 in /proc/cpuinfo; s3lvol_tgt will not start"
   fi
@@ -1853,6 +1856,99 @@ patch_cubelet_config_template() {
     else
       log "WARNING: Cubelet config missing cube_egress_admin_url key; skipped admin URL patch (${cubelet_config})"
     fi
+  fi
+}
+
+# _tune_toml_int_kv FILE KEY VALUE / _tune_toml_str_kv FILE KEY VALUE
+# Replace an uncommented `KEY = N` / `KEY = "..."` line, preserving indent.
+# Warn-only: a missing key never aborts the install (commented `# KEY =` lines
+# are not matched because the key must follow only leading whitespace).
+_tune_toml_int_kv() {
+  local file="$1" key="$2" val="$3"
+  if ! grep -Eq "^[[:space:]]*${key}[[:space:]]*=" "${file}"; then
+    log "WARNING: ${file} missing ${key}; skipped low-resource tune"
+    return 0
+  fi
+  sed -i -E "s|^([[:space:]]*)${key}[[:space:]]*=[[:space:]]*-?[0-9]+|\1${key} = ${val}|" "${file}"
+}
+
+_tune_toml_str_kv() {
+  local file="$1" key="$2" val="$3"
+  if ! grep -Eq "^[[:space:]]*${key}[[:space:]]*=" "${file}"; then
+    log "WARNING: ${file} missing ${key}; skipped low-resource tune"
+    return 0
+  fi
+  sed -i -E "s|^([[:space:]]*)${key}[[:space:]]*=[[:space:]]*\"[^\"]*\"|\1${key} = \"${val}\"|" "${file}"
+}
+
+_tune_yaml_int_kv() {
+  local file="$1" key="$2" val="$3"
+  if ! grep -Eq "^[[:space:]]*${key}[[:space:]]*:" "${file}"; then
+    log "WARNING: ${file} missing ${key}; skipped low-resource tune"
+    return 0
+  fi
+  sed -i -E "s|^([[:space:]]*)${key}[[:space:]]*:[[:space:]]*-?[0-9]+|\1${key}: ${val}|" "${file}"
+}
+
+# apply_low_resource_config_tuning CUBELET_CONFIG CUBEMASTER_CONF
+# riscv64 and other constrained hosts (nested KVM, TCG emulation, small VMs)
+# cannot meet the bare-metal-oriented defaults, which manifest as hard failures
+# rather than mere slowness:
+#   - node_status_update_frequency (shipped 1s) does DOUBLE duty: it is both the
+#     cubelet→CubeOps heartbeat cadence AND the HTTP client timeout for that
+#     register/report call (Cubelet/plugins/controller/cubelet_plugin.go:71).
+#     It must sit in a window bounded on BOTH sides:
+#       lower bound: a register cycle persists to MySQL server-side; under
+#         emulation that takes ~4-5s, so 1s cancels it ("context canceled") and
+#         the node never registers → "no healthy nodes".
+#       upper bound: CubeOps recomputes node health at READ time with a hardcoded
+#         15s expiry (CubeOps/internal/nodemanagement/service/health.go
+#         MetadataTimeout). CubeMaster's localcache trusts that verdict, so a
+#         cadence ≥15s makes the node flap HeartbeatExpired and every sandbox
+#         create that lands in the stale half-window fails with
+#         "template ... has no ready replica" (error 130400) even though the
+#         template_definition and its replica row are both READY.
+#     8s clears the ~5s persist with margin and keeps heartbeat age < 15s.
+#   - create_image_timeout_insec (300s) is the CubeMaster→cubelet CreateImage gRPC
+#     deadline; cubelet pulls the multi-GiB rootfs artifact synchronously inside
+#     it, so 300s → DeadlineExceeded and the artifact is GC'd (forced rebuild).
+#   - pool_size (3000) / tap_init_num (500) pre-create cgroups / taps at cubelet
+#     init, stalling startup for minutes under emulation.
+# Relax them for the constrained host. Warn-only and idempotent.
+apply_low_resource_config_tuning() {
+  local cubelet_config="${1:-}"
+  local cubemaster_conf="${2:-}"
+  local templatecenter_conf="${3:-}"
+  if [[ -n "${cubelet_config}" && -f "${cubelet_config}" ]]; then
+    _tune_toml_str_kv "${cubelet_config}" node_status_update_frequency "8s"
+    _tune_toml_int_kv "${cubelet_config}" pool_size 64
+    _tune_toml_int_kv "${cubelet_config}" tap_init_num 32
+    log "applied low-resource cubelet tuning: node_status_update_frequency=8s pool_size=64 tap_init_num=32"
+  fi
+  if [[ -n "${cubemaster_conf}" && -f "${cubemaster_conf}" ]]; then
+    _tune_yaml_int_kv "${cubemaster_conf}" create_image_timeout_insec 3600
+    _tune_yaml_int_kv "${cubemaster_conf}" app_snapshot_timeout_insec 1800
+    _tune_yaml_int_kv "${cubemaster_conf}" create_timeout_insec 1800
+    _tune_yaml_int_kv "${cubemaster_conf}" common_timeout_insec 300
+    # HTTP server WriteTimeout caps how long CubeMaster can stream a response
+    # body. The cubelet artifact pull is a single ~1 GiB GET served inside this
+    # window; the 360s default closes the stream mid-download under emulation
+    # (cubelet sees "unexpected EOF"). Read/Idle relaxed to match.
+    _tune_yaml_int_kv "${cubemaster_conf}" http_writetimeout 3600
+    _tune_yaml_int_kv "${cubemaster_conf}" http_readtimeout 600
+    _tune_yaml_int_kv "${cubemaster_conf}" http_idletimeout 3600
+    log "applied low-resource CubeMaster timeout tuning: create_image=3600 app_snapshot=1800 create=1800 common=300 http_write=3600 http_read=600 http_idle=3600"
+  fi
+  # CubeTemplateCenter is the reverse-proxy BACKEND that actually streams the
+  # artifact bytes to cubelet: CubeMaster proxies /cube/template/* (including
+  # artifact/download) to TC (template_proxy.go). TC's own http.Server
+  # WriteTimeout (360s default) otherwise closes the ~1 GiB response mid-body,
+  # which surfaces on cubelet as "unexpected EOF" through the proxy. Relax it.
+  if [[ -n "${templatecenter_conf}" && -f "${templatecenter_conf}" ]]; then
+    _tune_yaml_int_kv "${templatecenter_conf}" http_writetimeout 3600
+    _tune_yaml_int_kv "${templatecenter_conf}" http_readtimeout 600
+    _tune_yaml_int_kv "${templatecenter_conf}" http_idletimeout 3600
+    log "applied low-resource CubeTemplateCenter timeout tuning: http_write=3600 http_read=600 http_idle=3600"
   fi
 }
 

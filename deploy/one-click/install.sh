@@ -913,21 +913,45 @@ check_hardware_preflight() {
   if [[ ! -e /dev/kvm ]]; then
     log "KVM is not supported or not enabled (/dev/kvm not found)."
     log ""
-    log "If this host cannot expose hardware KVM (for example, it is itself a"
-    log "virtual machine without nested virtualization), you can try the"
-    log "open-source PVM stack shipped under deploy/pvm/ to turn the current"
-    log "guest into a PVM host that provides /dev/kvm to CubeSandbox:"
-    log ""
-    log "    sudo bash deploy/pvm/pvm_setup.sh"
-    log ""
-    log "That script will build and install a PVM-enabled host kernel, build a"
-    log "matching PVM guest vmlinux, and guide you through the reboot needed to"
-    log "switch into the new kernel. After reboot, re-run this installer."
-    log ""
-    log "WARNING: the open-source kvm-pvm integration is intended for"
-    log "development, evaluation and self-built experiments only. It is NOT"
-    log "suitable for production workloads -- expect reduced performance,"
-    log "limited hardware coverage and no long-term support guarantees."
+    local host_arch
+    host_arch="$(uname -m)"
+    if [[ "${host_arch}" == "x86_64" ]]; then
+      log "If this host cannot expose hardware KVM (for example, it is itself a"
+      log "virtual machine without nested virtualization), you can try the"
+      log "open-source PVM stack shipped under deploy/pvm/ to turn the current"
+      log "guest into a PVM host that provides /dev/kvm to CubeSandbox:"
+      log ""
+      log "    sudo bash deploy/pvm/pvm_setup.sh"
+      log ""
+      log "That script will build and install a PVM-enabled host kernel, build a"
+      log "matching PVM guest vmlinux, and guide you through the reboot needed to"
+      log "switch into the new kernel. After reboot, re-run this installer."
+      log ""
+      log "WARNING: the open-source kvm-pvm integration is intended for"
+      log "development, evaluation and self-built experiments only. It is NOT"
+      log "suitable for production workloads -- expect reduced performance,"
+      log "limited hardware coverage and no long-term support guarantees."
+    else
+      # PVM is x86_64-only. On riscv64/aarch64 the only path to /dev/kvm is
+      # native hardware virtualization, so point the user there instead.
+      log "The PVM fallback under deploy/pvm/ is x86_64-only and does NOT run"
+      log "on ${host_arch}. CubeSandbox on ${host_arch} requires native"
+      log "hardware virtualization exposing /dev/kvm:"
+      log ""
+      if [[ "${host_arch}" == "riscv64" ]]; then
+        log "  - a CPU implementing the RISC-V H (Hypervisor) extension"
+        log "  - the 'kvm' kernel module loaded (modprobe kvm)"
+        log "  - /dev/kvm present and accessible"
+      else
+        log "  - a CPU with virtualization extensions enabled (e.g. aarch64"
+        log "    EL2 / ARMv8 Virtualization Host Extensions)"
+        log "  - the 'kvm' kernel module loaded (modprobe kvm)"
+        log "  - /dev/kvm present and accessible"
+      fi
+      log ""
+      log "Use a bare-metal or nested-virtualization-capable ${host_arch} host"
+      log "that exposes /dev/kvm, then re-run this installer."
+    fi
     die "KVM is not supported or not enabled (/dev/kvm not found)."
   fi
 
@@ -940,6 +964,12 @@ check_hardware_preflight() {
       # Enforce that the threshold cannot be lower than the default 8GB (7500000 KB) in the authoritative installer
       if [[ "${CUBE_MIN_MEMORY_KB}" -ge 7500000 ]]; then
         min_mem_kb="${CUBE_MIN_MEMORY_KB}"
+      elif [[ "${ONE_CLICK_ALLOW_LOW_MEMORY:-0}" == "1" ]]; then
+        # Opt-in escape for constrained test hosts (e.g. a riscv64 nested-KVM VM
+        # with <8GB). The operator explicitly accepts reduced headroom; the
+        # authoritative installer keeps the 8GB floor otherwise.
+        min_mem_kb="${CUBE_MIN_MEMORY_KB}"
+        log "WARNING: ONE_CLICK_ALLOW_LOW_MEMORY=1 — lowering the memory floor to $((min_mem_kb / 1024))MB (below the 8GB default)."
       fi
     else
       die "Invalid CUBE_MIN_MEMORY_KB '${CUBE_MIN_MEMORY_KB}' (must be a positive integer greater than 0)."
@@ -1055,24 +1085,31 @@ check_cubelet_fs_preflight() {
   local fs_type
   fs_type="$(df -T "${check_path}" 2>/dev/null | awk 'NR==2 {print $2}')"
 
-  if [[ "${fs_type}" == "xfs" ]]; then
-    return 0
-  fi
+  # cubecow is a reflink-only CoW engine (see Cubelet/pkg/cubecow/doc.go): it
+  # needs a filesystem that supports FICLONE reflinks. Both XFS and Btrfs do, so
+  # accept either. (Historically only XFS was allowed; Btrfs is equally valid and
+  # is what riscv64 guest kernels commonly ship, since CONFIG_XFS_FS is often off
+  # while CONFIG_BTRFS_FS=m.)
+  case "${fs_type}" in
+    xfs|btrfs)
+      return 0
+      ;;
+  esac
 
   if [[ -d "${cubelet_dir}" ]] && mountpoint -q "${cubelet_dir}" 2>/dev/null; then
-    die "/data/cubelet is a mount point but its filesystem type is '${fs_type}' (requires xfs).
-  Please format the underlying partition as XFS and remount it at /data/cubelet:
-    mkfs.xfs /dev/<your-partition>
+    die "/data/cubelet is a mount point but its filesystem type is '${fs_type}' (requires a reflink-capable FS: xfs or btrfs).
+  Please format the underlying partition as XFS (or Btrfs) and remount it at /data/cubelet:
+    mkfs.xfs /dev/<your-partition>     # or: mkfs.btrfs /dev/<your-partition>
     mount /dev/<your-partition> /data/cubelet
   Troubleshooting: https://github.com/TencentCloud/CubeSandbox/issues/311"
   else
-    die "The filesystem that will host /data/cubelet is on '${check_path}' (type: ${fs_type:-unknown}), which is not XFS.
-  Cube Sandbox requires the /data/cubelet directory to reside on an XFS filesystem.
+    die "The filesystem that will host /data/cubelet is on '${check_path}' (type: ${fs_type:-unknown}), which is not reflink-capable.
+  Cube Sandbox requires the /data/cubelet directory to reside on an XFS or Btrfs filesystem (reflink/FICLONE CoW).
   Options:
-    1. Mount a dedicated XFS-formatted partition at /data/cubelet:
-         mkfs.xfs /dev/<your-partition>
+    1. Mount a dedicated XFS- or Btrfs-formatted partition at /data/cubelet:
+         mkfs.xfs /dev/<your-partition>     # or: mkfs.btrfs /dev/<your-partition>
          mount /dev/<your-partition> /data/cubelet
-    2. Ensure the parent path (${check_path}) itself is on XFS.
+    2. Ensure the parent path (${check_path}) itself is on XFS or Btrfs.
   Troubleshooting: https://github.com/TencentCloud/CubeSandbox/issues/311"
   fi
 }
@@ -1434,7 +1471,11 @@ systemd_target_for_role() {
 # CubeS3lvol's own version, as its VERSION file records it. Empty when the file
 # is not there.
 s3lvol_component_version() {
-  sed -n 's/^version:[[:space:]]*//p' "$1/VERSION" 2>/dev/null | head -1
+  # Tolerate a missing VERSION file (e.g. an omitted/empty CubeS3lvol package on
+  # arches where s3lvol is not shipped): return empty with rc 0 instead of
+  # failing the whole installer under `set -o pipefail`.
+  [[ -f "$1/VERSION" ]] || return 0
+  sed -n 's/^version:[[:space:]]*//p' "$1/VERSION" 2>/dev/null | head -1 || true
 }
 
 # Install CubeS3lvol under a versioned directory, with the bare name as a
@@ -1851,6 +1892,18 @@ patch_cubelet_config_template \
   "${CUBE_SANDBOX_CUBE_ROUTER_CIDR}" \
   "${CUBE_EGRESS_ADMIN_PORT}"
 
+# riscv64 / constrained hosts (nested KVM, TCG emulation, small VMs) cannot meet
+# the bare-metal-oriented cubelet + CubeMaster timing/pool defaults: the 1s node
+# register timeout and 300s CreateImage deadline cause hard failures (node never
+# registers; artifact distribution DeadlineExceeded), and eager cgroup/tap
+# pre-creation stalls init. Relax them unless the operator opted out.
+if [[ "$(uname -m)" == "riscv64" && "${ONE_CLICK_LOW_RESOURCE_TUNE:-1}" == "1" ]]; then
+  apply_low_resource_config_tuning \
+    "${PKG_ROOT}/Cubelet/config/config.toml" \
+    "${PKG_ROOT}/CubeMaster/conf.yaml" \
+    "${PKG_ROOT}/CubeTemplateCenter/conf.yaml"
+fi
+
 installed_role="${DEPLOY_ROLE}"
 detected_installed_role="$(detect_installed_role)"
 if [[ -n "${detected_installed_role}" ]]; then
@@ -1871,7 +1924,11 @@ assert_safe_install_prefix "${INSTALL_PREFIX}"
 # leaves s3lvol alone and only touches the other components, so a live sandbox
 # is paused for the swap and not for the whole install.
 S3LVOL_UPGRADE_RC=0
-if [[ -d "${PKG_ROOT}/CubeS3lvol" ]]; then
+# Skip staging entirely when the package ships an empty CubeS3lvol/ placeholder
+# (s3lvol is x86_64-only; on riscv64/arm64 the bundle omits its binaries but the
+# directory skeleton can remain). Staging an empty dir would create a bogus
+# versioned CubeS3lvol and fail s3lvol_component_version.
+if [[ -d "${PKG_ROOT}/CubeS3lvol" && -n "$(ls -A "${PKG_ROOT}/CubeS3lvol" 2>/dev/null)" ]]; then
   # Captured before staging: the orchestrator switches the bare name itself, and
   # once it has, there is nothing left to resolve the outgoing build through.
   S3LVOL_OLD_DIR="$(readlink -f "${INSTALL_PREFIX}/CubeS3lvol" 2>/dev/null || true)"

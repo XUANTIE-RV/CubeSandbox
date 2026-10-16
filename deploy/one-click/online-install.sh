@@ -359,7 +359,29 @@ http_get() {
 #   1. MIRROR=cn   -> https://download.cubesandbox.com/release/latest.json
 #                     (JSON body: {"url": "https://.../cube-sandbox-one-click-<version-or-sha>.tar.gz"})
 #   2. default     -> GitHub API latest release asset
+#
+# Release bundles may be published per-architecture with an arch suffix
+#   cube-sandbox-one-click-<version-or-sha>-<amd64|arm64|riscv64>.tar.gz
+# When such assets exist, prefer the one matching this host's architecture;
+# otherwise fall back to the legacy arch-less bundle name.
 # ---------------------------------------------------------------------------
+
+# Normalize the host architecture to the release token (amd64/arm64/riscv64).
+# ONE_CLICK_ARCH (if set) wins so callers can pin an arch explicitly.
+normalize_one_click_arch() {
+  local raw="${1:-}"
+  case "${raw}" in
+    amd64|x86_64) echo "amd64" ;;
+    arm64|aarch64) echo "arm64" ;;
+    riscv64) echo "riscv64" ;;
+    *) echo "" ;;
+  esac
+}
+HOST_ARCH_NORM="$(normalize_one_click_arch "${ONE_CLICK_ARCH:-$(uname -m)}")"
+if [[ -z "${HOST_ARCH_NORM}" ]]; then
+  echo "[online-install] WARNING: unsupported host architecture '$(uname -m)'; will only match arch-less bundles." >&2
+fi
+
 if [[ -z "${DOWNLOAD_URL}" ]]; then
   if [[ "${MIRROR}" == "cn" ]]; then
     echo "[online-install] MIRROR=cn, fetching latest release info from ${CN_MIRROR_LATEST_URL}..." >&2
@@ -396,19 +418,45 @@ PY
     # Extract the first browser_download_url that matches our tarball pattern.
     # We use Python (already required by the build scripts) for reliable JSON
     # parsing without needing jq.
-    DOWNLOAD_URL="$(python3 - "${RELEASE_JSON}" <<'PY'
+    DOWNLOAD_URL="$(python3 - "${RELEASE_JSON}" "${HOST_ARCH_NORM}" <<'PY'
 import json, sys, re
 
 data = json.loads(sys.argv[1])
+host_arch = sys.argv[2] if len(sys.argv) > 2 else ""
+KNOWN_ARCH = ("amd64", "arm64", "riscv64")
+# Accepts both arch-less and arch-suffixed bundle names.
 pattern = re.compile(r'^cube-sandbox-one-click-(?:[0-9a-f]+|v[0-9A-Za-z][0-9A-Za-z._-]*)\.tar\.gz$')
+
+def arch_of(name):
+    stem = name[:-len(".tar.gz")]
+    for a in KNOWN_ARCH:
+        if stem.endswith("-" + a):
+            return a
+    return None
+
+arch_match = None
+legacy_match = None
 for asset in data.get("assets", []):
-    if pattern.match(asset.get("name", "")):
-        print(asset["browser_download_url"])
-        sys.exit(0)
+    name = asset.get("name", "")
+    if not pattern.match(name):
+        continue
+    a = arch_of(name)
+    if a == host_arch and arch_match is None:
+        arch_match = asset["browser_download_url"]
+    elif a is None and legacy_match is None:
+        legacy_match = asset["browser_download_url"]
+
+# Prefer the host-arch bundle; fall back to the legacy arch-less name.
+if arch_match:
+    print(arch_match)
+    sys.exit(0)
+if legacy_match:
+    print(legacy_match)
+    sys.exit(0)
 sys.exit(1)
 PY
     )" || {
-      echo "[online-install] ERROR: could not find a cube-sandbox-one-click-<version-or-sha>.tar.gz asset in the latest release." >&2
+      echo "[online-install] ERROR: could not find a cube-sandbox-one-click-<version-or-sha>[-<arch>].tar.gz asset in the latest release (host arch: ${HOST_ARCH_NORM:-unknown})." >&2
       echo "[online-install] You can specify the URL manually:" >&2
       echo "[online-install]   online-install.sh --url=<download-url> [install.sh options...]" >&2
       exit 1

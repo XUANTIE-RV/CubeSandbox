@@ -30,6 +30,17 @@ Restart=on-failure
 RestartSec=2s
 TimeoutStartSec=60s
 TimeoutStopSec=30s
+# The artifact build (mkfs.ext4 + SHA256 over a 1 GiB ext4 + fs-store Put) is CPU
+# and I/O heavy. On a low-resource single node (e.g. riscv64 under emulation) that
+# load starves cubelet's heartbeats, so the node ages out of CubeMaster's healthy
+# set and distribution fails with "no healthy nodes available for template
+# creation" (the just-built artifact is then deleted, forcing a full rebuild).
+# TC is a background build service, never latency-critical, so run it at the
+# lowest CPU/IO priority: the heartbeat path (cubelet/CubeOps/mysqld, all default
+# priority) preempts it, while an otherwise-idle host still gives TC full speed.
+Nice=19
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 
 [Install]
 # Listed in cube-sandbox-control.target's Wants: CubeMaster no longer builds

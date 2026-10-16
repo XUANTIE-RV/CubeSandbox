@@ -67,8 +67,11 @@ LATEST_RELEASE_TAG="$(git -C "${ROOT_DIR}" describe --tags --abbrev=0 --match 'v
 export CUBE_VERSION CUBE_COMMIT CUBE_BUILD_TIME
 
 DIST_VERSION="${ONE_CLICK_DIST_VERSION:-${CUBE_VERSION_FROM_ENV:-${LATEST_RELEASE_TAG:-$(latest_git_revision "${ROOT_DIR}")}}}"
-DIST_ROOT="${SCRIPT_DIR}/dist/cube-sandbox-one-click-${DIST_VERSION}"
-DIST_TAR="${SCRIPT_DIR}/dist/cube-sandbox-one-click-${DIST_VERSION}.tar.gz"
+# Arch-suffixed bundle name when ONE_CLICK_ARCH is set (e.g. riscv64); x86/arm
+# builds leave it unset and keep the historical unsuffixed name.
+_ONE_CLICK_BUNDLE_ARCH_SUFFIX="${ONE_CLICK_ARCH:+-${ONE_CLICK_ARCH}}"
+DIST_ROOT="${SCRIPT_DIR}/dist/cube-sandbox-one-click-${DIST_VERSION}${_ONE_CLICK_BUNDLE_ARCH_SUFFIX}"
+DIST_TAR="${SCRIPT_DIR}/dist/cube-sandbox-one-click-${DIST_VERSION}${_ONE_CLICK_BUNDLE_ARCH_SUFFIX}.tar.gz"
 
 CUBEMASTER_BUILD_MODE="${ONE_CLICK_CUBEMASTER_BUILD_MODE:-local}"
 CUBELET_BUILD_MODE="${ONE_CLICK_CUBELET_BUILD_MODE:-local}"
@@ -280,6 +283,8 @@ PY
     if [[ -z "${agent_artifact}" ]]; then
       for candidate in \
         "${ROOT_DIR}/agent/target/x86_64-unknown-linux-musl/release/cube-agent" \
+        "${ROOT_DIR}/agent/target/aarch64-unknown-linux-musl/release/cube-agent" \
+        "${ROOT_DIR}/agent/target/riscv64gc-unknown-linux-musl/release/cube-agent" \
         "${ROOT_DIR}/agent/target/release/cube-agent"; do
         if [[ -f "${candidate}" ]]; then
           agent_artifact="${candidate}"
@@ -635,6 +640,14 @@ start_web_build_async() {
 
 ensure_sudo_authenticated_for_packaging() {
   [[ "${EUID}" -eq 0 ]] && return 0
+  # Non-root build environments without passwordless sudo (e.g. a dev host that
+  # cross-builds a riscv64 bundle from prebuilt artifacts) can opt out: with all
+  # ONE_CLICK_*_BIN overrides set and a fresh work dir, no packaging step needs
+  # root — remove_path_with_optional_sudo only escalates if a rm actually fails.
+  if [[ "${ONE_CLICK_NO_SUDO:-0}" == "1" ]]; then
+    log "ONE_CLICK_NO_SUDO=1: skipping sudo authentication for packaging"
+    return 0
+  fi
   if sudo -n true >/dev/null 2>&1; then
     return 0
   fi
@@ -1064,5 +1077,5 @@ EOF
 # exported by build-vm-assets.sh.
 generate_release_manifest "${DIST_ROOT}" "${DIST_VERSION}"
 
-tar_czf "${DIST_TAR}" "${SCRIPT_DIR}/dist" "cube-sandbox-one-click-${DIST_VERSION}"
+tar_czf "${DIST_TAR}" "${SCRIPT_DIR}/dist" "cube-sandbox-one-click-${DIST_VERSION}${_ONE_CLICK_BUNDLE_ARCH_SUFFIX}"
 log "release bundle ready: ${DIST_TAR}"

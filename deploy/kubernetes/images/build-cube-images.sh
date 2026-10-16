@@ -1041,7 +1041,8 @@ build_cube_kernel_image() {
   case "${arch}" in
     amd64) pvm_required=1 ;;
     arm64) pvm_required=0 ;;
-    *) fail "unsupported ONE_CLICK_ARCH for cube-kernel: ${arch} (use amd64 or arm64)" ;;
+    riscv64) pvm_required=0 ;;
+    *) fail "unsupported ONE_CLICK_ARCH for cube-kernel: ${arch} (use amd64, arm64 or riscv64)" ;;
   esac
 
   if [[ -n "${bm_src}" || -n "${pvm_src}" ]]; then
