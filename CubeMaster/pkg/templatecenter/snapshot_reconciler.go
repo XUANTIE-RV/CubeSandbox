@@ -32,8 +32,13 @@ var (
 )
 
 const (
-	snapshotReconcilerInterval  = 5 * time.Minute
-	snapshotOperationTimeout    = 15 * time.Minute
+	snapshotReconcilerInterval = 5 * time.Minute
+	// snapshotOperationTimeout bounds a single snapshot create/commit operation.
+	// 15 min is fine on bare metal but a 2 GiB app-snapshot on an emulated /
+	// low-clock target (riscv64 TCG nested-KVM testbed, FPGA) is bulk-I/O bound
+	// and can legitimately take several times longer; keep it generous so a slow
+	//-but-progressing snapshot is not aborted with "context deadline exceeded".
+	snapshotOperationTimeout    = 60 * time.Minute
 	snapshotMetricsTTL          = 10 * time.Minute
 	snapshotWarnThreshold       = 70
 	snapshotRejectThreshold     = 85

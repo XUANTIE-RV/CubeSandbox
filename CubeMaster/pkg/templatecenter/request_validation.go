@@ -5,21 +5,60 @@
 package templatecenter
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/constants"
+	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/log"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/base/node"
 	"github.com/tencentcloud/CubeSandbox/CubeMaster/pkg/service/sandbox/types"
 	cubeboxv1 "github.com/tencentcloud/CubeSandbox/pkgs/proto/services/cubebox/v1"
 )
 
-func resolveTemplateNodes(instanceType string, scope []string) ([]*node.Node, error) {
+// healthyTemplateNodesWait re-queries the node cache for up to
+// templateNodeWaitTotal when it momentarily reports zero healthy nodes.
+//
+// CubeMaster's localcache is refreshed periodically from CubeOps and "trusts the
+// CubeOps Healthy verdict" (localcache cloneNodeWithCurrentHealth). On a small
+// single node the template artifact build (mkfs + SHA256 over 1 GiB + fs Put)
+// can delay cubelet heartbeats enough that a cache refresh samples the node as
+// unhealthy; the distribution step that runs immediately after the build then
+// sees zero candidates even though the database still has a fresh, healthy
+// heartbeat. Waiting out a couple of refresh cycles recovers the node instead of
+// failing a build that already produced a READY artifact (which is then GC'd,
+// forcing a full ~20-min rebuild). Only the zero-node path waits.
+const (
+	templateNodeWaitTotal = 180 * time.Second
+	templateNodeWaitPoll  = 5 * time.Second
+)
+
+func healthyTemplateNodesWait(instanceType string) []*node.Node {
 	nodes := healthyTemplateNodes(instanceType)
+	if len(nodes) > 0 {
+		return nodes
+	}
+	logger := log.G(context.Background())
+	deadline := time.Now().Add(templateNodeWaitTotal)
+	for attempt := 1; time.Now().Before(deadline); attempt++ {
+		logger.Warnf("template node selection saw 0 healthy nodes for instance_type=%q; waiting out possible cache staleness (attempt %d, budget %s)", instanceType, attempt, templateNodeWaitTotal)
+		time.Sleep(templateNodeWaitPoll)
+		nodes = healthyTemplateNodes(instanceType)
+		if len(nodes) > 0 {
+			logger.Infof("template node selection recovered %d healthy node(s) for instance_type=%q after %d attempt(s)", len(nodes), instanceType, attempt)
+			return nodes
+		}
+	}
+	return nodes
+}
+
+func resolveTemplateNodes(instanceType string, scope []string) ([]*node.Node, error) {
+	nodes := healthyTemplateNodesWait(instanceType)
 	if len(nodes) == 0 {
 		return nil, ErrNoTemplateNodes
 	}

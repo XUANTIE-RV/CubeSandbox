@@ -27,10 +27,12 @@ import (
 // commitSandboxRPCTimeout caps how long runTemplateCommitJob waits on the
 // cubelet CommitSandbox RPC. The detached background context has no deadline
 // of its own, so a hung cubelet would otherwise leave the job stuck in
-// SNAPSHOTTING forever. Typical successful snapshots complete in 5-15s; the
-// generous 5 minute ceiling accommodates large memory footprints while still
-// guaranteeing eventual failure resolution.
-const commitSandboxRPCTimeout = 5 * time.Minute
+// SNAPSHOTTING forever. On bare metal a 2 GiB snapshot commits in seconds, but
+// on an emulated / low-clock target (riscv64 TCG nested-KVM testbed, FPGA) the
+// same commit is bulk-I/O bound and can run many minutes; keep the ceiling
+// generous so a slow-but-progressing commit is not aborted with "context
+// deadline exceeded" while still guaranteeing eventual failure resolution.
+const commitSandboxRPCTimeout = 30 * time.Minute
 
 // cleanupTemplateRPCTimeout bounds the best-effort cleanup RPC used when the
 // commit job rolls back after a partial success.
