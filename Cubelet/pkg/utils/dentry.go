@@ -69,7 +69,18 @@ func GetDeviceIdleRatio(path string) (uint64, uint64, error) {
 	if err != nil {
 		return 0, 0, err
 	}
-	return uint64(100) * buf.Bavail / buf.Blocks, uint64(100) * buf.Ffree / buf.Files, nil
+	// Filesystems with dynamically allocated inodes (btrfs, and some network
+	// filesystems) report f_files == 0, so the inode-idle ratio has no meaning
+	// and dividing by it would panic. Treat a zero denominator as "no data" and
+	// report a 0 ratio rather than crashing the caller.
+	var spaceIdle, inodeIdle uint64
+	if buf.Blocks > 0 {
+		spaceIdle = uint64(100) * buf.Bavail / buf.Blocks
+	}
+	if buf.Files > 0 {
+		inodeIdle = uint64(100) * buf.Ffree / buf.Files
+	}
+	return spaceIdle, inodeIdle, nil
 }
 
 func GetAllDirname(pathname string) ([]string, error) {

@@ -47,7 +47,14 @@ CUBE_COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 CUBE_BUILD_TIME ?= $(shell date -u +'%Y-%m-%dT%H:%M:%SZ')
 
 VERSION_PKG=$(PKG)/version
-BUILD_FLAGS=-ldflags "-s -w \
+# CUBE_STATIC=1 fully static-links the cgo binaries (musl). Static ELF has no
+# PT_INTERP, so the riscv64 build runs on any glibc/musl target without needing
+# the cross-toolchain's musl loader at runtime.
+CUBE_STATIC_LDFLAGS=
+ifeq ($(CUBE_STATIC),1)
+CUBE_STATIC_LDFLAGS=-linkmode external -extldflags -static
+endif
+BUILD_FLAGS=-ldflags "-s -w $(CUBE_STATIC_LDFLAGS) \
   -X '$(VERSION_PKG).Version=$(CUBE_VERSION)' \
   -X '$(VERSION_PKG).Commit=$(CUBE_COMMIT)' \
   -X '$(VERSION_PKG).BuildTime=$(CUBE_BUILD_TIME)'"

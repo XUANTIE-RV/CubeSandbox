@@ -521,8 +521,11 @@ func createTestConfig() Config {
 func TestMain(m *testing.M) {
 	oldEnsureRoute := ensureRouteToCubeDevFunc
 	ensureRouteToCubeDevFunc = func(_ string, _ *systemnet.CubeDev) error { return nil }
+	oldEnsureAddr := ensureCubeDevAddrFunc
+	ensureCubeDevAddrFunc = func(_ *systemnet.CubeDev) error { return nil }
 	code := m.Run()
 	ensureRouteToCubeDevFunc = oldEnsureRoute
+	ensureCubeDevAddrFunc = oldEnsureAddr
 	os.Exit(code)
 }
 

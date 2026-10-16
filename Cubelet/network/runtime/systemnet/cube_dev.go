@@ -24,6 +24,7 @@ type CubeDev struct {
 	Index int
 	Name  string
 	IP    net.IP
+	Mask  int
 	Mac   net.HardwareAddr
 }
 
@@ -79,6 +80,7 @@ func GetOrCreateCubeDev(ip net.IP, mask, mtu int, macAddr string) (*CubeDev, err
 			Index: dummy.Index,
 			Name:  cubeDevName,
 			IP:    ip,
+			Mask:  mask,
 			Mac:   dummy.HardwareAddr,
 		}, nil
 	}
@@ -109,8 +111,48 @@ func GetOrCreateCubeDev(ip net.IP, mask, mtu int, macAddr string) (*CubeDev, err
 		Index: dummy.Index,
 		Name:  cubeDevName,
 		IP:    ip,
+		Mask:  mask,
 		Mac:   dummy.HardwareAddr,
 	}, nil
+}
+
+// EnsureCubeDevAddr re-asserts the gateway IPv4 on an existing cube-dev. The
+// dummy link survives events (e.g. a network-manager flush or an address
+// lifecycle race) that can strip its address while the link itself stays up;
+// without the gateway IP the host cannot source probe/DNAT packets toward the
+// sandbox CIDR, so every create silently times out (runbook bug #18). This is a
+// cheap idempotent check meant to run per-create, unlike GetOrCreateCubeDev
+// which also reconciles link existence/MTU and only runs at controller init.
+func EnsureCubeDevAddr(dev *CubeDev) error {
+	if dev == nil {
+		return errors.New("cube-dev not initialized")
+	}
+	link, err := netlinkLinkByName(dev.Name)
+	if err != nil {
+		return err
+	}
+	addrs, err := netlinkAddrList(link, netlink.FAMILY_V4)
+	if err != nil {
+		return err
+	}
+	for _, addr := range addrs {
+		if addr.IPNet == nil || !addr.IPNet.IP.Equal(dev.IP) {
+			continue
+		}
+		if ones, _ := addr.IPNet.Mask.Size(); ones == dev.Mask {
+			return nil
+		}
+	}
+	desiredAddr := &netlink.Addr{
+		IPNet: &net.IPNet{
+			IP:   dev.IP,
+			Mask: net.CIDRMask(dev.Mask, 32),
+		},
+	}
+	if err := netlink.AddrAdd(link, desiredAddr); err != nil && !errors.Is(err, syscall.EEXIST) {
+		return err
+	}
+	return nil
 }
 
 // AddARPEntry installs a permanent neighbor entry so sandbox traffic targeting

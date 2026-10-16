@@ -26,6 +26,7 @@ var (
 	// Function variable keeps route setup replaceable in tests without changing
 	// production call sites.
 	ensureRouteToCubeDevFunc = systemnet.EnsureRouteToCubeDev
+	ensureCubeDevAddrFunc    = systemnet.EnsureCubeDevAddr
 )
 
 // managedState is the runtime-owned form of a persisted sandbox network. The
@@ -1277,10 +1278,16 @@ func (s *NetworkController) persistMetadata(base map[string]string, tapName stri
 }
 
 // ensureHostRoute reasserts the route to the sandbox CIDR through cube-dev.
-// ensureHostRoute installs the node-invariant route toward cubeDev once per
-// process; subsequent creates skip the netlink probe entirely. A failure is
-// not latched: the next create retries the installation.
+// The gateway address on cube-dev is re-asserted on EVERY create (it can be
+// stripped mid-life by an external flush while the link stays up, which would
+// otherwise make all sandbox probes silently time out — runbook bug #18), while
+// the node-invariant route is installed once per process; subsequent creates
+// skip the route netlink probe. Neither failure is latched: the next create
+// retries.
 func (s *NetworkController) ensureHostRoute() error {
+	if err := ensureCubeDevAddrFunc(s.cubeDev); err != nil {
+		return err
+	}
 	s.routeMu.Lock()
 	defer s.routeMu.Unlock()
 	if s.routeEnsured {
