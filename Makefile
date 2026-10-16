@@ -456,7 +456,7 @@ cubelet: builder-image
 
 cubelet-riscv64: riscv64-builder-image
 	@mkdir -p "$(OUTPUT_DIR)"
-	$(MAKE) builder-run BUILDER_CMD='set -eu; cd /workspace/cubecow; rustup target add riscv64gc-unknown-linux-musl --toolchain 1.89; CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER=riscv64-linux-musl-gcc cargo build --release -p cubecow --target riscv64gc-unknown-linux-musl; mkdir -p /workspace/Cubelet/third_party/cubecow/lib /workspace/Cubelet/third_party/cubecow/include; install -m 0644 target/riscv64gc-unknown-linux-musl/release/libcubecow.a /workspace/Cubelet/third_party/cubecow/lib/libcubecow.a; install -m 0644 include/cubecow.h /workspace/Cubelet/third_party/cubecow/include/cubecow.h; cd /workspace/CubeNet/cubevs; BPF_TARGET_ARCH=riscv64 make gen; cd /workspace/Cubelet; make proto; CC=riscv64-linux-musl-gcc CGO_ENABLED=1 GOOS=linux GOARCH=riscv64 make build; install -m 0755 build/cubelet /workspace/_output/bin/cubelet-riscv64; install -m 0755 build/cubecli /workspace/_output/bin/cubecli-riscv64'
+	$(MAKE) builder-run BUILDER_CMD='set -eu; cd /workspace/cubecow; rustup target add riscv64gc-unknown-linux-musl --toolchain 1.89; CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER=riscv64-linux-musl-gcc cargo build --release -p cubecow --target riscv64gc-unknown-linux-musl; mkdir -p /workspace/Cubelet/third_party/cubecow/lib /workspace/Cubelet/third_party/cubecow/include; install -m 0644 target/riscv64gc-unknown-linux-musl/release/libcubecow.a /workspace/Cubelet/third_party/cubecow/lib/libcubecow.a; install -m 0644 include/cubecow.h /workspace/Cubelet/third_party/cubecow/include/cubecow.h; cd /workspace/CubeNet/cubevs; BPF_TARGET_ARCH=riscv64 make gen; cd /workspace/Cubelet; make proto; CC=riscv64-linux-musl-gcc CGO_ENABLED=1 GOOS=linux GOARCH=riscv64 CUBE_STATIC=1 make build; install -m 0755 build/cubelet /workspace/_output/bin/cubelet-riscv64; install -m 0755 build/cubecli /workspace/_output/bin/cubecli-riscv64'
 
 .PHONY: cubevsmapdump cubevsmapdump-riscv64
 cubevsmapdump: builder-image
@@ -532,9 +532,14 @@ cubeapi: builder-image
 	@mkdir -p "$(OUTPUT_DIR)"
 	$(MAKE) builder-run BUILDER_CMD='mkdir -p /workspace/_output/bin && cd /workspace/CubeAPI && CC_$(TARGET_ARCH)_unknown_linux_musl=musl-gcc cargo build --release --locked --target $(TARGET_ARCH)-unknown-linux-musl && install -m 0755 /workspace/CubeAPI/target/$(TARGET_ARCH)-unknown-linux-musl/release/cube-api /workspace/_output/bin/cube-api'
 
+# riscv64 note: CubeAPI's [profile.release] sets lto="fat"; the LLVM riscv64
+# backend miscompiles the axum/hyper request path under fat LTO, so cube-api
+# (static musl) SIGSEGVs at NULL on the first HTTP request. opt-level=0 and
+# lto=false both run clean, so disable LTO for riscv64 only (x86/arm64 keep fat
+# LTO). +crt-static comes from CubeAPI/.cargo/config.toml.
 cubeapi-riscv64: riscv64-builder-image
 	@mkdir -p "$(OUTPUT_DIR)"
-	$(MAKE) builder-run BUILDER_CMD='cd /workspace/CubeAPI && rustup target add riscv64gc-unknown-linux-musl --toolchain 1.85 && CC_riscv64gc_unknown_linux_musl=riscv64-linux-musl-gcc CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER=riscv64-linux-musl-gcc cargo build --release --locked --target riscv64gc-unknown-linux-musl && install -m 0755 target/riscv64gc-unknown-linux-musl/release/cube-api /workspace/_output/bin/cube-api-riscv64'
+	$(MAKE) builder-run BUILDER_CMD='cd /workspace/CubeAPI && rustup target add riscv64gc-unknown-linux-musl --toolchain 1.85 && CC_riscv64gc_unknown_linux_musl=riscv64-linux-musl-gcc CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER=riscv64-linux-musl-gcc CARGO_PROFILE_RELEASE_LTO=false cargo build --release --locked --target riscv64gc-unknown-linux-musl && install -m 0755 target/riscv64gc-unknown-linux-musl/release/cube-api /workspace/_output/bin/cube-api-riscv64'
 
 .PHONY: cube-api
 cube-api: cubeapi
@@ -671,7 +676,7 @@ shim: builder-image
 
 shim-riscv64: riscv64-builder-image
 	@mkdir -p "$(OUTPUT_DIR)"
-	$(MAKE) builder-run BUILDER_CMD='cd /workspace/CubeShim && rustup target add riscv64gc-unknown-linux-musl --toolchain 1.85 && LIBSECCOMP_LINK_TYPE=static LIBSECCOMP_LIB_PATH=/usr/local/riscv64-linux-musl/libseccomp/lib LIBCAPNG_LINK_TYPE=static LIBCAPNG_LIB_PATH=/usr/local/riscv64-linux-musl/libcap-ng/lib CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER=riscv64-linux-musl-gcc cargo +1.85 build --release --locked --target riscv64gc-unknown-linux-musl && install -m 0755 target/riscv64gc-unknown-linux-musl/release/containerd-shim-cube-rs /workspace/_output/bin/containerd-shim-cube-rs-riscv64 && install -m 0755 target/riscv64gc-unknown-linux-musl/release/cube-runtime /workspace/_output/bin/cube-runtime-riscv64'
+	$(MAKE) builder-run BUILDER_CMD='cd /workspace/CubeShim && rustup target add riscv64gc-unknown-linux-musl --toolchain 1.85 && LIBSECCOMP_LINK_TYPE=static LIBSECCOMP_LIB_PATH=/usr/local/riscv64-linux-musl/libseccomp/lib LIBCAPNG_LINK_TYPE=static LIBCAPNG_LIB_PATH=/usr/local/riscv64-linux-musl/libcap-ng/lib CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER=riscv64-linux-musl-gcc RUSTFLAGS=-Ctarget-feature=+crt-static cargo +1.85 build --release --locked --target riscv64gc-unknown-linux-musl && install -m 0755 target/riscv64gc-unknown-linux-musl/release/containerd-shim-cube-rs /workspace/_output/bin/containerd-shim-cube-rs-riscv64 && install -m 0755 target/riscv64gc-unknown-linux-musl/release/cube-runtime /workspace/_output/bin/cube-runtime-riscv64'
 
 # Build a guest kernel image (vmlinux for x86_64, Image for aarch64/riscv64) from an external kernel source tree.
 #   make guest-kernel KERNEL_SRC=/path/to/linux                            # native build for the host arch
