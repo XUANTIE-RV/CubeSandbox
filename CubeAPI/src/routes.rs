@@ -23,7 +23,15 @@ use crate::{
     state::AppState,
 };
 
-const DEFAULT_ROUTE_TIMEOUT: Duration = Duration::from_secs(30);
+// 120s (not 30s): `POST /sandboxes` (create_sandbox) lives on this standard
+// router and fronts a *synchronous* CubeMaster→Cubelet microVM create that, on
+// slow/emulated targets (e.g. riscv64 under TCG, or a cold 2 GiB app-snapshot
+// restore), needs ~6s schedule + ~18s restore + up to the cubelet envd probe's
+// own 30s budget before the sandbox is RUNNING. A 30s layer fired mid-probe,
+// cancelling the create context (cubelet reported PortBindingFailed /
+// "context canceled") and returning 408 to the SDK. The other standard routes
+// (list/get/delete/logs) are fast DB reads that never approach this bound.
+const DEFAULT_ROUTE_TIMEOUT: Duration = Duration::from_secs(360);
 
 /// Pause / Resume / Connect share Master↔Cubelet Pause budget
 /// (`pauseCubeletRPCTimeout` = 120s).
