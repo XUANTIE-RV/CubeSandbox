@@ -1,0 +1,11 @@
+# sha1sums-riscv64 -- integrity manifest for the pre-released riscv64 guest
+# assets downloaded by fetch_guest_assets_riscv64.sh (mirrors sha1sums-x86_64).
+#
+# Populate at plan 件 0 once the assets are published to a Release. Format is
+# standard `sha1sum` output (paths relative to $WORKLOADS_DIR):
+#
+#   <40-hex-sha1>  Image
+#   <40-hex-sha1>  fw_dynamic.bin
+#
+# Until then this file intentionally contains no sum lines, and the fetch script
+# skips verification (it checks for a ^[0-9a-f]{40} line before running sha1sum -c).
