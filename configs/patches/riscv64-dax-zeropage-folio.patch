@@ -1,0 +1,61 @@
+Subject: [PATCH] fs/dax: check zero/empty entry before dax_to_folio in
+ dax_disassociate_entry
+
+dax_disassociate_entry() derives the folio BEFORE testing whether the entry is
+a zero/empty entry:
+
+    struct folio *folio = dax_to_folio(entry);
+    if (dax_is_zero_entry(entry) || dax_is_empty_entry(entry))
+            return;
+    dax_folio_put(folio);
+
+For a zero/empty entry the encoded pfn is 0, so dax_to_folio() evaluates
+page_folio(pfn_to_page(0)), which dereferences vmemmap[0]. On arches whose
+system RAM does not start at pfn 0 (riscv places RAM at 0x40000000), vmemmap[0]
+is not populated, so the dereference takes a load page fault. This is hit on
+the very first DAX write fault that replaces a zero page:
+
+  Unable to handle kernel paging request at ff1c000000000008
+  epc: dax_to_folio+0x4a  ra: dax_disassociate_entry+0x16
+   dax_iomap_pte_fault -> dax_insert_entry -> dax_disassociate_entry -> dax_to_folio
+  Kernel panic - Attempted to kill init!  (booting with root=/dev/pmem0 rootflags=dax)
+
+x86 never faults because pfn 0 has a struct page there, which is why the bug is
+latent upstream but fatal for riscv fsdax (e.g. a DAX root filesystem).
+
+Fix: move the zero/empty test ahead of dax_to_folio(), matching the ordering
+already used by the other dax entry helpers. The folio is only needed on the
+non-special path.
+
+Out-of-tree note: the guest kernel (Linux v7.2) is external to this repo and is
+built via `make guest-kernel KERNEL_SRC=<tree>`. Apply before building:
+
+    patch -p1 -d "$KERNEL_SRC" < configs/patches/riscv64-dax-zeropage-folio.patch
+
+Drop once the reorder lands upstream.
+
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@ -505,11 +505,21 @@
+ static void dax_disassociate_entry(void *entry, struct address_space *mapping,
+ 				bool trunc)
+ {
+-	struct folio *folio = dax_to_folio(entry);
++	struct folio *folio;
+ 
++	/*
++	 * Test for the zero/empty entry BEFORE deriving a folio. Their pfn is 0,
++	 * and dax_to_folio() -> page_folio(pfn_to_page(0)) dereferences
++	 * vmemmap[0], which is unmapped on arches whose RAM does not start at
++	 * pfn 0 (e.g. riscv, RAM at 0x40000000). Computing the folio first thus
++	 * faults in the DAX path (dax_iomap_pte_fault -> dax_insert_entry ->
++	 * here) when replacing a zero page. The unused-args warning for
++	 * mapping/trunc is pre-existing.
++	 */
+ 	if (dax_is_zero_entry(entry) || dax_is_empty_entry(entry))
+ 		return;
+ 
++	folio = dax_to_folio(entry);
+ 	dax_folio_put(folio);
+ }
+ 
