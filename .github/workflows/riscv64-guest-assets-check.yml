@@ -1,0 +1,66 @@
+name: RISC-V Guest Assets Check
+
+# Downloads the PRE-RELEASE riscv64 guest assets (Linux 7.2 kernel Image, OpenSBI
+# 1.7 fw_dynamic, Ubuntu riscv64 rootfs) using the same wget-from-GitHub-Release
+# mechanism the x86-64 integration tests use, then verifies they are fetchable,
+# intact, and assembleable (PE-magic kernel, qemu-img-recognized rootfs).
+#
+# This is a pure download/assemble check -- no KVM, no boot. Booting + vAIA
+# snapshot/restore lives in riscv64-snapshot-integration.yml (self-hosted, gated).
+#
+# GATED: skipped until a maintainer publishes the riscv64 assets to a Release and
+# sets the repo variable CUBE_RISCV64_ASSET_BASE (plan 件 0). Until then there is
+# nothing to download, so the job skips rather than failing every PR.
+
+on:
+  pull_request:
+    paths:
+      - 'hypervisor/**'
+      - 'configs/kernel-oc9.riscv64.config'
+      - 'hypervisor/scripts/fetch_guest_assets_riscv64.sh'
+      - 'hypervisor/scripts/sha1sums-riscv64'
+      - '.github/workflows/riscv64-guest-assets-check.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: riscv64-guest-assets-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-assets:
+    name: Fetch + assemble riscv64 guest assets
+    runs-on: ubuntu-latest
+    if: ${{ vars.CUBE_RISCV64_ASSET_BASE != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install qemu-utils + unzip
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y qemu-utils unzip
+
+      - name: Fetch released riscv64 guest assets
+        env:
+          CUBE_RISCV64_ASSET_BASE: ${{ vars.CUBE_RISCV64_ASSET_BASE }}
+          CUBE_RISCV64_ROOTFS_URL: ${{ vars.CUBE_RISCV64_ROOTFS_URL }}
+          WORKLOADS_DIR: ${{ github.workspace }}/workloads
+        run: |
+          set -euo pipefail
+          chmod +x hypervisor/scripts/fetch_guest_assets_riscv64.sh
+          hypervisor/scripts/fetch_guest_assets_riscv64.sh
+
+      - name: Upload assembled guest assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: riscv64-guest-assets
+          path: |
+            workloads/Image
+            workloads/fw_dynamic.bin
+            workloads/ubuntu-riscv64.raw
+          if-no-files-found: error
+          retention-days: 1
