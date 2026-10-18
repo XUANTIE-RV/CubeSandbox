@@ -1,0 +1,95 @@
+name: RISC-V Snapshot Integration
+
+# riscv64 microVM boot + vAIA snapshot/restore -- the counterpart of the x86-64
+# hypervisor-integration.yaml (dev_cli.sh tests --integration --quick, which
+# covers test_direct_kernel_boot / test_snapshot_restore_basic on GH's x86 KVM).
+#
+# HARD CONSTRAINT: Cube-Hypervisor(riscv64) is a KVM VMM, so this needs a
+# self-hosted riscv64 runner with the H-extension (/dev/kvm). GitHub-hosted
+# runners have no riscv64 KVM, and it cannot run under qemu TCG either. So the
+# job is GATED: it is skipped unless a maintainer registers a riscv64+KVM runner
+# and sets the repo variable RISCV64_KVM_RUNNER_ENABLED=true (plan 件 4).
+
+on:
+  pull_request:
+    paths:
+      - 'hypervisor/**'
+      - 'CubeShim/**'
+      - 'agent/**'
+      - 'guest-init/**'
+      - 'hypervisor/scripts/run_integration_tests_riscv64.sh'
+      - '.github/workflows/riscv64-snapshot-integration.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: riscv64-snapshot-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot-restore:
+    name: riscv64 boot + vAIA snapshot/restore
+    # Gated: skipped (not pending) until a riscv64+KVM self-hosted runner exists.
+    if: ${{ vars.RISCV64_KVM_RUNNER_ENABLED == 'true' }}
+    runs-on: [self-hosted, riscv64, kvm]
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Assert riscv64 KVM present
+        run: |
+          set -euo pipefail
+          [ -e /dev/kvm ] || { echo "NO-KVM: riscv64 H-extension unavailable"; exit 2; }
+          [ "$(uname -m)" = riscv64 ] || { echo "runner is not riscv64"; exit 2; }
+
+      - name: Cross/native build riscv64 components
+        run: |
+          set -euo pipefail
+          # On a native riscv64 runner the normal targets build natively; the
+          # *-riscv64 targets also work. SKIP_BUILDER_IMAGE_CHECK lets a runner
+          # with a prebuilt builder image reuse it.
+          make all-riscv64 SKIP_BUILDER_IMAGE_CHECK=1 || make all-riscv64
+
+      - name: Fetch released riscv64 guest assets
+        env:
+          CUBE_RISCV64_ASSET_BASE: ${{ vars.CUBE_RISCV64_ASSET_BASE }}
+          CUBE_RISCV64_ROOTFS_URL: ${{ vars.CUBE_RISCV64_ROOTFS_URL }}
+          WORKLOADS_DIR: ${{ github.workspace }}/workloads
+        run: |
+          set -euo pipefail
+          chmod +x hypervisor/scripts/fetch_guest_assets_riscv64.sh
+          hypervisor/scripts/fetch_guest_assets_riscv64.sh
+
+      - name: Run riscv64 snapshot/restore smoke
+        env:
+          WORKLOADS_DIR: ${{ github.workspace }}/workloads
+          SNAPSHOT_MODE: ${{ vars.RISCV64_SNAPSHOT_MODE || 'shim' }}
+          # Runner-prestaged testbed assets (guest OS image, cube-agent.ext4,
+          # cube-spec.json / cube-spec-restore.json, cube-min.tar). Provided by
+          # the self-hosted runner image; see validation-runbook.md.
+          GUEST_OS_IMAGE: ${{ vars.RISCV64_GUEST_OS_IMAGE }}
+          CUBE_AGENT_EXT4: ${{ vars.RISCV64_CUBE_AGENT_EXT4 }}
+          SPEC: ${{ vars.RISCV64_CUBE_SPEC }}
+          SPEC_RESTORE: ${{ vars.RISCV64_CUBE_SPEC_RESTORE }}
+          CUBE_MIN_TAR: ${{ vars.RISCV64_CUBE_MIN_TAR }}
+        run: |
+          set -euo pipefail
+          chmod +x hypervisor/scripts/run_integration_tests_riscv64.sh
+          hypervisor/scripts/run_integration_tests_riscv64.sh --quick
+
+      - name: Upload serial / VMM logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: riscv64-snapshot-logs
+          path: |
+            workloads/l2-serial*.log
+            /data/log/CubeVmm/*.log
+            /data/log/CubeShim/*.log
+          if-no-files-found: ignore
+          retention-days: 7
