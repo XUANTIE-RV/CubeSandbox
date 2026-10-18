@@ -1,0 +1,91 @@
+name: Deploy Script Check
+
+# PR gate for the deploy shell scripts. The riscv64 port touched deploy/one-click
+# (arch normalization, H-extension detection, native MySQL/Redis, install paths)
+# but no existing PR workflow lints deploy/**/*.sh -- terraform-validate only
+# covers deploy/one-click/terraform/**. This adds a fast bash -n + shellcheck
+# gate over ONLY the .sh files a PR changes (the repo has ~295 .sh; linting all
+# would be slow and drown in pre-existing style noise).
+
+on:
+  pull_request:
+    paths:
+      - 'deploy/**/*.sh'
+      - '.github/workflows/deploy-script-check.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-script-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: shellcheck changed deploy scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install shellcheck
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Lint changed deploy/*.sh
+        env:
+          # Pass event SHAs through the environment, never interpolated straight
+          # into the shell, so a crafted ref/PR field cannot inject commands.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -uo pipefail
+          if [[ -n "${BASE_SHA}" && "${BASE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+            range="${BASE_SHA}..${HEAD_SHA}"
+          elif [[ -n "${BEFORE_SHA}" && "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+            range="${BEFORE_SHA}..${GITHUB_SHA}"
+          else
+            range=""
+          fi
+
+          if [[ -z "${range}" ]]; then
+            echo "No diff range available (first push?); linting all tracked deploy/**/*.sh"
+            mapfile -t files < <(git ls-files 'deploy/**/*.sh')
+          else
+            mapfile -t files < <(git diff --name-only --diff-filter=ACMR "${range}" -- 'deploy/**/*.sh')
+          fi
+
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            echo "No deploy/**/*.sh changed -- nothing to lint."
+            exit 0
+          fi
+
+          printf 'Changed deploy scripts (%d):\n' "${#files[@]}"
+          printf '  %s\n' "${files[@]}"
+
+          fail=0
+          for f in "${files[@]}"; do
+            [[ -f "${f}" ]] || continue
+            echo "=== bash -n ${f} ==="
+            if ! bash -n "${f}"; then
+              echo "::error file=${f}::bash syntax error"; fail=1
+            fi
+            echo "=== shellcheck ${f} ==="
+            # -S warning: only warning/error severity, so pre-existing style
+            # nitpicks in untouched lines do not fail the gate.
+            if ! shellcheck -S warning "${f}"; then
+              echo "::error file=${f}::shellcheck found warning+ issues"; fail=1
+            fi
+          done
+
+          if [[ "${fail}" -ne 0 ]]; then
+            echo "::error::deploy script lint failed (see above)"
+            exit 1
+          fi
+          echo "All changed deploy scripts passed bash -n + shellcheck."
