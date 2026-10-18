@@ -312,6 +312,80 @@ jobs:
             test "${member_count}" -gt 0
           )
 
+      - name: Upload RISC-V binaries for the qemu-user smoke job
+        uses: actions/upload-artifact@v4
+        with:
+          name: riscv64-binaries
+          path: _output/bin/*-riscv64
+          if-no-files-found: error
+          retention-days: 1
+
+  # Runtime smoke: actually EXECUTE each cross-built riscv64 binary under
+  # qemu-user. They are fully static musl ELFs (Makefile *-riscv64 targets pass
+  # CUBE_STATIC=1 / -Ctarget-feature=+crt-static), so no guest rootfs is needed.
+  # The amd64/arm64 `build` job only checks `test -x`; this goes further and
+  # confirms each binary loads and starts without a fatal signal -- which is what
+  # catches e.g. the riscv64 fat-LTO miscompile that made cube-api SIGSEGV at
+  # NULL on the first request (see the Makefile cubeapi-riscv64 LTO=false note).
+  # Deep runtime behaviour (serving a request, vAIA snapshot/restore) needs a
+  # riscv64 KVM host -- see riscv64-snapshot-integration.yml (self-hosted, gated).
+  smoke-riscv64:
+    name: RISC-V qemu-user smoke
+    needs: build-riscv64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download RISC-V binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: riscv64-binaries
+          path: riscv64-bin
+
+      - name: Install qemu-user-static
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+          qemu-riscv64-static --version | head -1
+
+      - name: Execute each riscv64 binary under qemu-user
+        run: |
+          set -uo pipefail
+          cd riscv64-bin
+          chmod +x ./*-riscv64 2>/dev/null || true
+          fail=0
+          for bin in *-riscv64; do
+            [[ -f "${bin}" ]] || continue
+            # A binary passes if ANY invocation form exits without a fatal
+            # signal. Fatal signals: SIGSEGV=139, SIGILL=132, SIGABRT=134,
+            # SIGBUS=135. A clean exit, a usage error (1/2), or a timeout (124)
+            # all mean the ELF loaded and started executing correctly.
+            ok=0
+            for args in "--version" "--help" ""; do
+              # EVERY form is timeout-wrapped: some binaries ignore --version/
+              # --help and block (e.g. cube-lifecycle-manager starts a service),
+              # which would otherwise hang the step forever. A timeout (124) is
+              # treated as OK below -- the ELF loaded and started executing.
+              if [[ -n "${args}" ]]; then
+                timeout 15s qemu-riscv64-static "./${bin}" ${args} >/dev/null 2>&1; rc=$?
+              else
+                timeout 10s qemu-riscv64-static "./${bin}" >/dev/null 2>&1; rc=$?
+              fi
+              case "${rc}" in
+                139|132|134|135) ;;  # fatal signal -> try the next form
+                *) ok=1; echo "  OK    ${bin}: exit ${rc} (args '${args}')"; break ;;
+              esac
+            done
+            if [[ "${ok}" -ne 1 ]]; then
+              echo "  FAIL  ${bin}: fatal signal on --version/--help/no-arg (last rc=${rc})"
+              fail=1
+            fi
+          done
+          if [[ "${fail}" -ne 0 ]]; then
+            echo "::error::one or more riscv64 binaries crashed under qemu-user (see FAIL lines)"
+            exit 1
+          fi
+          echo "All riscv64 binaries executed under qemu-user without a fatal signal."
+
   # Docker smoke build for release images that use repo-root context +
   # adjacent Dockerfile.dockerignore (catches context/ignore regressions).
   docker-smoke:
