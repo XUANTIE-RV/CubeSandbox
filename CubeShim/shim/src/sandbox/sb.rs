@@ -402,13 +402,21 @@ impl SandBox {
             if p.placeholder {
                 continue;
             }
-            // riscv64 Linux 6.6 has no FS_DAX (ZONE_DEVICE needs
-            // ARCH_HAS_PTE_DEVMAP, which riscv does not select), so ext4 rejects
-            // the "dax" mount option with EINVAL. Mirror guest-init and mount the
-            // business pmem read-only without dax there; keep dax elsewhere.
-            #[cfg(target_arch = "riscv64")]
-            let pmem_options = vec!["ro".to_string()];
-            #[cfg(not(target_arch = "riscv64"))]
+            // Mount the business pmem read-only with dax on every arch,
+            // matching guest-init's /run/support mount. riscv64 dax needs
+            // FS_DAX + ZONE_DEVICE in the guest kernel; both supported kernels
+            // provide them, via different mechanisms:
+            //   - XuanTie ali6000 6.6.y backports the old pte_devmap path
+            //     (ARCH_HAS_PTE_DEVMAP=y); dax snapshot validated there.
+            //   - Mainline 7.2 dropped pte_devmap and drives dax through the
+            //     folio path, but its dax_disassociate_entry() derived a folio
+            //     before the zero/empty guard, so a zero entry hit
+            //     pfn_to_page(0) -> vmemmap[0], unmapped on riscv (RAM starts at
+            //     0x40000000) and crashed guest init. Fixed out-of-tree by
+            //     configs/patches/riscv64-dax-zeropage-folio.patch; dax restore
+            //     validated on 7.2 with that patch.
+            // The old no-dax fallback wrongly assumed mainline riscv 6.6 and
+            // left dax unused on kernels that do support it, so it is removed.
             let pmem_options = vec!["ro".to_string(), "dax".to_string()];
 
             let ps = agent::Storage {
