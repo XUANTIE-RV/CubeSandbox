@@ -32,7 +32,7 @@ use std::sync::mpsc::channel;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 pub mod cmd;
 
 pub const SUB_CMD: &str = "snapshot";
@@ -361,23 +361,47 @@ impl Snapshot {
     }
 
     fn wait_vm_ready(&self) -> CResult<()> {
-        let ev = self
-            .ch_rx
-            .as_ref()
-            .unwrap()
-            .recv_timeout(Duration::from_nanos(1000 * 1000 * 1000 * 3));
-        if let Err(e) = ev {
-            return Err(format!("Wait vm ready err:{}", e));
+        // Readiness is signalled by the guest writing the sys_ctrl notification
+        // MMIO: SysStart (kernel started) or VsockServerReady (cube-agent's vsock
+        // server is up -- the same signal the shim's normal boot path waits on,
+        // see sandbox/sb.rs). A minimal guest may raise VsockServerReady without
+        // a separate SysStart, so accept either, skip unrelated events, and fail
+        // fast on VmShutdown. The 3s default suits bare-metal KVM; nested/emulated
+        // (TCG) hosts boot the L2 far slower, so allow an override via
+        // CUBE_VM_READY_TIMEOUT_SECS (and a settle delay via CUBE_VM_SETTLE_SECS)
+        // instead of failing the snapshot prematurely.
+        let ready_secs = std::env::var("CUBE_VM_READY_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(3);
+        let rx = self.ch_rx.as_ref().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(ready_secs);
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "Wait vm ready err: timed out after {}s (no SysStart/VsockServerReady)",
+                    ready_secs
+                ));
+            }
+            match rx.recv_timeout(deadline - now) {
+                Ok(NotifyEvent::SysStart) | Ok(NotifyEvent::VsockServerReady) => break,
+                Ok(NotifyEvent::VmShutdown) => {
+                    return Err(format!(
+                        "Wait vm ready err: guest shut down before ready ({:?})",
+                        NotifyEvent::VmShutdown
+                    ));
+                }
+                Ok(_) => continue,
+                Err(e) => return Err(format!("Wait vm ready err:{}", e)),
+            }
         }
-        let ev = ev.unwrap();
-        if ev != NotifyEvent::SysStart {
-            return Err(format!(
-                "Not an expected event, expected:{:?}, actual:{:?}",
-                NotifyEvent::SysStart,
-                ev
-            ));
-        }
-        thread::sleep(Duration::from_secs(3));
+        let settle_secs = std::env::var("CUBE_VM_SETTLE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(3);
+        thread::sleep(Duration::from_secs(settle_secs));
         Ok(())
     }
 
