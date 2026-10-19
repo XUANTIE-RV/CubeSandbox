@@ -1,0 +1,216 @@
+From 49587b856d87a692d891ec294f3666ea455dccba Mon Sep 17 00:00:00 2001
+From: "yanan.he" <yanan.he@linux.alibaba.com>
+Date: Mon, 19 Oct 2026 23:15:35 +0800
+Subject: [PATCH] KVM: riscv: backport dirty-log fast-path zero-page + Accessed
+ fixes to v7.2
+
+Backport of two upstream fixes for the dirty-log write fault fast path
+introduced by commit 7705be59eb2d ("KVM: riscv: Fast-path dirty logging
+write faults"), adapted to Linux v7.2. Both are by SeungJu Cheon and carry
+Fixes: 7705be59eb2d / Cc: stable # 7.2+ upstream:
+
+  1) "KVM: riscv: Set Accessed bit in dirty-log write fault fast path"
+     (Message-Id: 20261016101458.221648-1-suunj1331@gmail.com). The fast path
+     made the leaf writable+dirty but left Accessed clear, so a guest store
+     could re-fault; set it via pte_mkyoung() and include _PAGE_ACCESSED in
+     the already-done check.
+
+  2) "KVM: riscv: Only fast-path dirty-log write faults on host-writable
+     leaves" (Message-Id: 20261017030927.345454-1-suunj1331@gmail.com). The
+     fast path promoted an existing G-stage leaf to writable without checking
+     that the host backing was writable. A guest read fault on an untouched
+     guest-RAM page maps the shared empty_zero_page read-only
+     (__kvm_faultin_pfn returns ZERO_PAGE with writable=false, a read-only gup
+     cannot CoW), and gstage write-protection for dirty logging only clears
+     _PAGE_WRITE, so a write-protected real page and a read-only zero-page
+     leaf are indistinguishable by the usual flags. A later guest write then
+     promoted the zero-page leaf to writable and the store landed on the host
+     global empty_zero_page, corrupting every fresh anonymous read fault
+     system-wide. Record host writability in RSW bit 9
+     (KVM_GSTAGE_PTE_HOST_WRITABLE) at map time and only fast-path leaves that
+     carry it, otherwise fall back to the slow path (FOLL_WRITE gup -> CoW).
+
+Backport notes for v7.2: kvm_riscv_gstage_update_pte_prot() has a single
+caller (kvm_riscv_gstage_map_page) in v7.2, so the host-writable bit is OR'd
+into prot inside map_page (covering both the update_pte_prot and set_pte
+paths) rather than threading a new parameter through update_pte_prot as the
+newer upstream series does. host_writable is captured from the faultin result
+BEFORE the "logging && !is_write" read-only downgrade, matching the upstream
+intent to record host writability before dirty logging forces the mapping
+read-only.
+
+Reproduced independently on a nested-KVM (H-extension) riscv64 host under QEMU
+TCG at -smp 4 running an L2 with dirty logging during snapshot/restore: the
+host empty_zero_page (phys 0x81439000) took a stray guest word (0x57ac6e9d) at
+offset 0, after which every fresh anon mmap and every MADV_DONTNEED re-fault
+returned it (Go "fatal error: arena already initialized", awk "internal error:
+segfault"), silently and until reboot; -smp 1 is unaffected. With this backport
+the same create+snapshot+restore workload at -smp 4 keeps empty_zero_page
+all-zero, a self-checking churn detector (fresh-mmap / MADV_DONTNEED must read
+zero, memset-verify) reports zero corruption, and the restore reaches RUNNING.
+
+Out-of-tree note: the guest kernel (Linux v7.2) is external to this repo and is
+built via `make guest-kernel KERNEL_SRC=<tree>` or the yocto linux-cube-guest /
+linux-xuantie 7.2 recipes. Apply before building:
+
+    patch -p1 -d "$KERNEL_SRC" < configs/patches/riscv64-kvm-zeropage-dirtylog.patch
+
+Drop once both upstream fixes land in a 7.2.y stable release. When forwarding
+upstream, preserve the original author's Signed-off-by and add a backporter
+Signed-off-by plus a [ v7.2: ... ] adaptation annotation.
+
+Original-author: SeungJu Cheon <suunj1331@gmail.com>
+Fixes: 7705be59eb2d ("KVM: riscv: Fast-path dirty logging write faults")
+Cc: stable@vger.kernel.org
+Assisted-by: Qoder
+Signed-off-by: yanan.he <yanan.he@linux.alibaba.com>
+---
+ arch/riscv/include/asm/kvm_gstage.h | 11 +++++++-
+ arch/riscv/kvm/gstage.c             | 11 +++++++-
+ arch/riscv/kvm/mmu.c                | 39 +++++++++++++++++++++++++----
+ 3 files changed, 54 insertions(+), 7 deletions(-)
+
+diff --git a/arch/riscv/include/asm/kvm_gstage.h b/arch/riscv/include/asm/kvm_gstage.h
+index 21e2019..4991ad8 100644
+--- a/arch/riscv/include/asm/kvm_gstage.h
++++ b/arch/riscv/include/asm/kvm_gstage.h
+@@ -32,6 +32,15 @@ struct kvm_gstage_mapping {
+ 
+ extern unsigned long kvm_riscv_gstage_max_pgd_levels;
+ 
++/*
++ * RSW bit 9 (software-reserved, ignored by hardware): records that the host
++ * mapping behind this G-stage leaf was writable when the leaf was created. The
++ * dirty-log write fault fast path uses it to tell a dirty-tracking
++ * write-protected real page from a read-only mapping of the shared zero page
++ * (both have _PAGE_WRITE clear), and only promotes host-writable leaves.
++ */
++#define KVM_GSTAGE_PTE_HOST_WRITABLE	BIT(9)
++
+ #define kvm_riscv_gstage_pgd_xbits	2
+ #define kvm_riscv_gstage_pgd_size	(1UL << (HGATP_PAGE_SHIFT + kvm_riscv_gstage_pgd_xbits))
+ 
+@@ -61,7 +70,7 @@ bool kvm_riscv_gstage_try_update_pte(struct kvm_gstage *gstage, u32 level,
+ int kvm_riscv_gstage_map_page(struct kvm_gstage *gstage,
+ 			      struct kvm_mmu_memory_cache *pcache,
+ 			      gpa_t gpa, phys_addr_t hpa, unsigned long page_size,
+-			      bool page_rdonly, bool page_exec,
++			      bool page_rdonly, bool page_exec, bool host_writable,
+ 			      struct kvm_gstage_mapping *out_map);
+ 
+ int kvm_riscv_gstage_split_huge(struct kvm_gstage *gstage,
+diff --git a/arch/riscv/kvm/gstage.c b/arch/riscv/kvm/gstage.c
+index b0474fc..15173f1 100644
+--- a/arch/riscv/kvm/gstage.c
++++ b/arch/riscv/kvm/gstage.c
+@@ -207,7 +207,7 @@ static void kvm_riscv_gstage_update_pte_prot(struct kvm_gstage *gstage, u32 leve
+ int kvm_riscv_gstage_map_page(struct kvm_gstage *gstage,
+ 			      struct kvm_mmu_memory_cache *pcache,
+ 			      gpa_t gpa, phys_addr_t hpa, unsigned long page_size,
+-			      bool page_rdonly, bool page_exec,
++			      bool page_rdonly, bool page_exec, bool host_writable,
+ 			      struct kvm_gstage_mapping *out_map)
+ {
+ 	bool found_leaf;
+@@ -248,6 +248,15 @@ int kvm_riscv_gstage_map_page(struct kvm_gstage *gstage,
+ 			prot = PAGE_WRITE;
+ 	}
+ 
++	/*
++	 * Record host writability in RSW bit 9 so the dirty-log write fault fast
++	 * path can distinguish a dirty-tracking write-protected real page from a
++	 * read-only mapping of the shared zero page -- both have _PAGE_WRITE
++	 * clear, but only the former may be promoted to writable in place.
++	 */
++	if (host_writable)
++		prot = __pgprot(pgprot_val(prot) | KVM_GSTAGE_PTE_HOST_WRITABLE);
++
+ 	found_leaf = kvm_riscv_gstage_get_leaf(gstage, gpa, &ptep, &ptep_level);
+ 	if (found_leaf) {
+ 		/*
+diff --git a/arch/riscv/kvm/mmu.c b/arch/riscv/kvm/mmu.c
+index 8a0aa5e..fbd1dec 100644
+--- a/arch/riscv/kvm/mmu.c
++++ b/arch/riscv/kvm/mmu.c
+@@ -499,19 +499,37 @@ static bool kvm_riscv_mmu_dirty_log_write_fault_fast(struct kvm *kvm,
+ 			break;
+ 		}
+ 
++		/*
++		 * Only fast-path leaves whose host backing was writable when the
++		 * G-stage mapping was created (recorded in RSW bit 9). A read
++		 * fault on an untouched guest-RAM page legitimately maps the
++		 * shared zero page read-only, and gstage write-protection for
++		 * dirty logging only clears _PAGE_WRITE -- so a dirty-tracking
++		 * write-protected real page and a read-only zero-page mapping are
++		 * indistinguishable by the usual flags. Promoting a non
++		 * host-writable leaf in place would let the guest store straight
++		 * into the host's global empty_zero_page; bail so the slow path
++		 * re-faults with FOLL_WRITE and breaks CoW into a real page.
++		 */
++		if (!(pte_val(old_pte) & KVM_GSTAGE_PTE_HOST_WRITABLE)) {
++			ret = false;
++			break;
++		}
++
+ 		if (!dirty_marked) {
+ 			mark_page_dirty_in_slot(kvm, memslot, gfn);
+ 			dirty_marked = true;
+ 		}
+ 
+-		if ((pte_val(old_pte) & (_PAGE_WRITE | _PAGE_DIRTY)) ==
+-		    (_PAGE_WRITE | _PAGE_DIRTY)) {
++		if ((pte_val(old_pte) &
++		     (_PAGE_WRITE | _PAGE_DIRTY | _PAGE_ACCESSED)) ==
++		    (_PAGE_WRITE | _PAGE_DIRTY | _PAGE_ACCESSED)) {
+ 			new_pte = old_pte;
+ 			ret = true;
+ 			break;
+ 		}
+ 
+-		new_pte = pte_mkdirty(pte_mkwrite_novma(old_pte));
++		new_pte = pte_mkyoung(pte_mkdirty(pte_mkwrite_novma(old_pte)));
+ 
+ 		if (kvm_riscv_gstage_try_update_pte(&gstage, ptep_level, gpa,
+ 						    ptep, old_pte, new_pte)) {
+@@ -541,6 +559,7 @@ int kvm_riscv_mmu_map(struct kvm_vcpu *vcpu, struct kvm_memory_slot *memslot,
+ 	kvm_pfn_t hfn;
+ 	bool is_hugetlb;
+ 	bool writable;
++	bool host_writable;
+ 	short vma_pageshift;
+ 	gfn_t gfn = gpa >> PAGE_SHIFT;
+ 	struct vm_area_struct *vma;
+@@ -623,6 +642,14 @@ int kvm_riscv_mmu_map(struct kvm_vcpu *vcpu, struct kvm_memory_slot *memslot,
+ 	if (is_error_noslot_pfn(hfn))
+ 		return -EFAULT;
+ 
++	/*
++	 * Record whether the host backing page is writable BEFORE dirty logging
++	 * forces the G-stage mapping read-only below. RSW bit 9 carries this to
++	 * the leaf so the dirty-log write fast path only promotes leaves that
++	 * were host-writable (never a read-only mapping of the shared zero page).
++	 */
++	host_writable = writable;
++
+ 	/*
+ 	 * If logging is active then we allow writable pages only
+ 	 * for write faults.
+@@ -646,10 +673,12 @@ int kvm_riscv_mmu_map(struct kvm_vcpu *vcpu, struct kvm_memory_slot *memslot,
+ 	if (writable) {
+ 		mark_page_dirty_in_slot(kvm, memslot, gfn);
+ 		ret = kvm_riscv_gstage_map_page(&gstage, pcache, gpa, hfn << PAGE_SHIFT,
+-						vma_pagesize, false, true, out_map);
++						vma_pagesize, false, true, host_writable,
++						out_map);
+ 	} else {
+ 		ret = kvm_riscv_gstage_map_page(&gstage, pcache, gpa, hfn << PAGE_SHIFT,
+-						vma_pagesize, true, true, out_map);
++						vma_pagesize, true, true, host_writable,
++						out_map);
+ 	}
+ 
+ 	if (ret)
+-- 
+2.34.1
+
