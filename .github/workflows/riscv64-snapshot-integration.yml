@@ -4,11 +4,26 @@ name: RISC-V Snapshot Integration
 # hypervisor-integration.yaml (dev_cli.sh tests --integration --quick, which
 # covers test_direct_kernel_boot / test_snapshot_restore_basic on GH's x86 KVM).
 #
-# HARD CONSTRAINT: Cube-Hypervisor(riscv64) is a KVM VMM, so this needs a
-# self-hosted riscv64 runner with the H-extension (/dev/kvm). GitHub-hosted
-# runners have no riscv64 KVM, and it cannot run under qemu TCG either. So the
-# job is GATED: it is skipped unless a maintainer registers a riscv64+KVM runner
-# and sets the repo variable RISCV64_KVM_RUNNER_ENABLED=true (plan 件 4).
+# Backend = C1 (plan 件 4, confirmed): a GitHub-hosted x86 runner + an in-job
+# QEMU/TCG L1 (riscv64, -cpu max with the H-extension + AIA aplic-imsic). The L1
+# kernel (7.2, CONFIG_KVM=y) gets /dev/kvm from QEMU's emulated H-extension, so
+# cube-runtime / Cube-Hypervisor running INSIDE the L1 boot an L2 microVM over
+# nested KVM and exercise vAIA snapshot/restore -- no self-hosted riscv64
+# hardware and no host KVM required. Everything is TCG-emulated, hence slow; the
+# timeout is generous. The L1 orchestration lives in
+# hypervisor/scripts/run_c1_nested_riscv64.sh (the CI codification of the
+# hand-validated cube-72-snap-bed testbed).
+#
+# GUEST KERNEL: built IN-PLACE by build_guest_kernel_riscv64.sh (fetch kernel.org
+# v7.2 source -> apply the two CubeSandbox patches -> cross-compile the PE Image).
+# Building from source+patches every run GUARANTEES the KVM dirty-log backport
+# (configs/patches/riscv64-kvm-zeropage-dirtylog.patch) is present: without it the
+# KVM dirty-log fast path lets the L2 write through a read-only ZERO_PAGE G-stage
+# leaf into the L1's empty_zero_page at -smp>1, corrupting every fresh anon page in
+# the L1 (Go "arena already initialized" / awk segfault). With it, -smp>1 is safe;
+# RISCV64_L1_SMP defaults to 4 (set 1 to sidestep entirely). No 件 0 Release asset
+# and no CUBE_RISCV64_ASSET_BASE variable are required -- opensbi fw_dynamic and the
+# Ubuntu rootfs are wget'd from official public sources by fetch_guest_assets_riscv64.sh.
 
 on:
   pull_request:
@@ -17,7 +32,11 @@ on:
       - 'CubeShim/**'
       - 'agent/**'
       - 'guest-init/**'
-      - 'hypervisor/scripts/run_integration_tests_riscv64.sh'
+      - 'configs/kernel-oc9.riscv64.config'
+      - 'configs/patches/**'
+      - 'scripts/build-kernel.sh'
+      - 'deploy/one-click/build-guest-image-riscv64.sh'
+      - 'deploy/one-click/build-agent-ext4.sh'
       - '.github/workflows/riscv64-snapshot-integration.yml'
   workflow_dispatch:
 
@@ -28,68 +47,107 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  WORKLOADS_DIR: ${{ github.workspace }}/workloads
+
 jobs:
-  snapshot-restore:
-    name: riscv64 boot + vAIA snapshot/restore
-    # Gated: skipped (not pending) until a riscv64+KVM self-hosted runner exists.
-    if: ${{ vars.RISCV64_KVM_RUNNER_ENABLED == 'true' }}
-    runs-on: [self-hosted, riscv64, kvm]
-    timeout-minutes: 90
+  snapshot-restore-c1:
+    name: riscv64 C1 nested-TCG boot + vAIA snapshot/restore
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - name: Assert riscv64 KVM present
+      - name: Install QEMU + guest tooling + riscv64 kernel cross toolchain
         run: |
           set -euo pipefail
-          [ -e /dev/kvm ] || { echo "NO-KVM: riscv64 H-extension unavailable"; exit 2; }
-          [ "$(uname -m)" = riscv64 ] || { echo "runner is not riscv64"; exit 2; }
+          sudo apt-get update
+          # qemu-system-misc provides qemu-system-riscv64 (ubuntu-24.04: qemu 8.2,
+          # which supports -cpu max H-extension + aia=aplic-imsic); qemu-utils for
+          # qemu-img; cloud-image-utils for cloud-localds (NoCloud seed); mtools as
+          # a seed fallback; e2fsprogs for the guest-image/agent ext4 builders.
+          # gcc-riscv64-linux-gnu + the kernel build deps cross-compile the 7.2
+          # guest Image in-place (build_guest_kernel_riscv64.sh -> build-kernel.sh).
+          sudo apt-get install -y \
+            qemu-system-misc qemu-utils cloud-image-utils mtools e2fsprogs \
+            openssh-client btrfs-progs \
+            gcc-riscv64-linux-gnu build-essential bc bison flex libelf-dev \
+            libssl-dev libncurses-dev dwarves cpio kmod rsync xz-utils patch
+          qemu-system-riscv64 --version | head -1
+          riscv64-linux-gnu-gcc --version | head -1
 
-      - name: Cross/native build riscv64 components
+      - name: Build riscv64 components
         run: |
           set -euo pipefail
-          # On a native riscv64 runner the normal targets build natively; the
-          # *-riscv64 targets also work. SKIP_BUILDER_IMAGE_CHECK lets a runner
+          # Produces _output/bin/*-riscv64 (cube-runtime, containerd-shim-cube-rs,
+          # cube-agent, cube-init, ...). SKIP_BUILDER_IMAGE_CHECK lets a runner
           # with a prebuilt builder image reuse it.
           make all-riscv64 SKIP_BUILDER_IMAGE_CHECK=1 || make all-riscv64
 
-      - name: Fetch released riscv64 guest assets
-        env:
-          CUBE_RISCV64_ASSET_BASE: ${{ vars.CUBE_RISCV64_ASSET_BASE }}
-          CUBE_RISCV64_ROOTFS_URL: ${{ vars.CUBE_RISCV64_ROOTFS_URL }}
-          WORKLOADS_DIR: ${{ github.workspace }}/workloads
+      - name: Build 7.2 guest kernel Image (in-place, cross-compiled)
         run: |
           set -euo pipefail
+          chmod +x hypervisor/scripts/build_guest_kernel_riscv64.sh
+          # -> ${WORKLOADS_DIR}/Image (PE/EFI-stub, CONFIG_KVM=y, both patches applied).
+          # Serves BOTH the C1 L1 host kernel (qemu -kernel, needs /dev/kvm) and the
+          # L2 guest kernel. WORKLOADS_DIR is inherited from the workflow env.
+          hypervisor/scripts/build_guest_kernel_riscv64.sh
+
+      - name: Fetch riscv64 guest assets (opensbi + rootfs)
+        env:
+          CUBE_RISCV64_ROOTFS_URL: ${{ vars.CUBE_RISCV64_ROOTFS_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${WORKLOADS_DIR}"
           chmod +x hypervisor/scripts/fetch_guest_assets_riscv64.sh
+          # -> ${WORKLOADS_DIR}/{fw_dynamic.bin,ubuntu-riscv64.raw}
           hypervisor/scripts/fetch_guest_assets_riscv64.sh
 
-      - name: Run riscv64 snapshot/restore smoke
-        env:
-          WORKLOADS_DIR: ${{ github.workspace }}/workloads
-          SNAPSHOT_MODE: ${{ vars.RISCV64_SNAPSHOT_MODE || 'shim' }}
-          # Runner-prestaged testbed assets (guest OS image, cube-agent.ext4,
-          # cube-spec.json / cube-spec-restore.json, cube-min.tar). Provided by
-          # the self-hosted runner image; see validation-runbook.md.
-          GUEST_OS_IMAGE: ${{ vars.RISCV64_GUEST_OS_IMAGE }}
-          CUBE_AGENT_EXT4: ${{ vars.RISCV64_CUBE_AGENT_EXT4 }}
-          SPEC: ${{ vars.RISCV64_CUBE_SPEC }}
-          SPEC_RESTORE: ${{ vars.RISCV64_CUBE_SPEC_RESTORE }}
-          CUBE_MIN_TAR: ${{ vars.RISCV64_CUBE_MIN_TAR }}
+      - name: Build L2 guest OS image (pmem0) + cube-agent ext4 (pmem1)
         run: |
           set -euo pipefail
-          chmod +x hypervisor/scripts/run_integration_tests_riscv64.sh
-          hypervisor/scripts/run_integration_tests_riscv64.sh --quick
+          chmod +x deploy/one-click/build-guest-image-riscv64.sh deploy/one-click/build-agent-ext4.sh
+          # cube-guest-image-cpu.img: the L2 guest rootfs (/sbin/init = cube-init).
+          OUTPUT_DIR="${WORKLOADS_DIR}" \
+            ONE_CLICK_CUBE_INIT_BIN="${GITHUB_WORKSPACE}/_output/bin/cube-init-riscv64" \
+            ./deploy/one-click/build-guest-image-riscv64.sh
+          # cube-agent.ext4: the cube-agent pmem1 payload.
+          OUTPUT_DIR="${WORKLOADS_DIR}" \
+            ONE_CLICK_CUBE_AGENT_BIN="${GITHUB_WORKSPACE}/_output/bin/cube-agent-riscv64" \
+            ./deploy/one-click/build-agent-ext4.sh
+          ls -la "${WORKLOADS_DIR}"/cube-guest-image-cpu.img "${WORKLOADS_DIR}"/cube-agent.ext4
 
-      - name: Upload serial / VMM logs
+      - name: Generate cube snapshot assets (spec + min.tar)
+        run: |
+          set -euo pipefail
+          chmod +x hypervisor/scripts/gen_cube_snapshot_assets_riscv64.sh
+          # -> ${WORKLOADS_DIR}/{cube-spec.json,cube-spec-restore.json,cube-min.tar}
+          OUTPUT_DIR="${WORKLOADS_DIR}" CUBE_ARCH=riscv64 \
+            hypervisor/scripts/gen_cube_snapshot_assets_riscv64.sh
+
+      - name: Run C1 nested snapshot/restore (boot L1 under QEMU TCG, test inside)
+        env:
+          BIN_DIR: ${{ github.workspace }}/_output/bin
+          L1_SMP: ${{ vars.RISCV64_L1_SMP || '4' }}
+          L1_MEM: ${{ vars.RISCV64_L1_MEM || '4G' }}
+          RUNDIR: ${{ runner.temp }}/c1-l1
+        run: |
+          set -euo pipefail
+          chmod +x hypervisor/scripts/run_c1_nested_riscv64.sh \
+                   hypervisor/scripts/run_integration_tests_riscv64.sh
+          hypervisor/scripts/run_c1_nested_riscv64.sh
+
+      - name: Upload L1 / L2 logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: riscv64-snapshot-logs
+          name: riscv64-c1-snapshot-logs
           path: |
-            workloads/l2-serial*.log
-            /data/log/CubeVmm/*.log
-            /data/log/CubeShim/*.log
+            ${{ runner.temp }}/c1-l1/serial.log
+            ${{ runner.temp }}/c1-l1/integration.log
+            ${{ runner.temp }}/c1-l1/qemu-guest-errors.log
           if-no-files-found: ignore
           retention-days: 7

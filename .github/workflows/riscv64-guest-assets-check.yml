@@ -1,16 +1,17 @@
 name: RISC-V Guest Assets Check
 
-# Downloads the PRE-RELEASE riscv64 guest assets (Linux 7.2 kernel Image, OpenSBI
-# 1.7 fw_dynamic, Ubuntu riscv64 rootfs) using the same wget-from-GitHub-Release
+# Downloads the riscv64 guest assets that HAVE official public prebuilts (OpenSBI
+# 1.7 fw_dynamic, Ubuntu riscv64 rootfs) using the same wget-from-public-source
 # mechanism the x86-64 integration tests use, then verifies they are fetchable,
-# intact, and assembleable (PE-magic kernel, qemu-img-recognized rootfs).
+# intact, and assembleable (qemu-img-recognized rootfs).
 #
-# This is a pure download/assemble check -- no KVM, no boot. Booting + vAIA
-# snapshot/restore lives in riscv64-snapshot-integration.yml (self-hosted, gated).
+# The Linux 7.2 guest kernel Image is NOT fetched here -- kernel.org ships source
+# only (no prebuilt riscv64 Image), so it is built IN-PLACE by
+# riscv64-snapshot-integration.yml (件 4) via build_guest_kernel_riscv64.sh. This
+# job deliberately stays a fast download/assemble check (no kernel cross-build).
 #
-# GATED: skipped until a maintainer publishes the riscv64 assets to a Release and
-# sets the repo variable CUBE_RISCV64_ASSET_BASE (plan 件 0). Until then there is
-# nothing to download, so the job skips rather than failing every PR.
+# This is a pure download/assemble check -- no KVM, no boot, no kernel build.
+# Booting + vAIA snapshot/restore lives in riscv64-snapshot-integration.yml.
 
 on:
   pull_request:
@@ -33,7 +34,6 @@ jobs:
   fetch-assets:
     name: Fetch + assemble riscv64 guest assets
     runs-on: ubuntu-latest
-    if: ${{ vars.CUBE_RISCV64_ASSET_BASE != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -44,9 +44,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-utils unzip
 
-      - name: Fetch released riscv64 guest assets
+      - name: Fetch riscv64 guest assets (opensbi + rootfs)
         env:
-          CUBE_RISCV64_ASSET_BASE: ${{ vars.CUBE_RISCV64_ASSET_BASE }}
           CUBE_RISCV64_ROOTFS_URL: ${{ vars.CUBE_RISCV64_ROOTFS_URL }}
           WORKLOADS_DIR: ${{ github.workspace }}/workloads
         run: |
@@ -59,7 +58,6 @@ jobs:
         with:
           name: riscv64-guest-assets
           path: |
-            workloads/Image
             workloads/fw_dynamic.bin
             workloads/ubuntu-riscv64.raw
           if-no-files-found: error

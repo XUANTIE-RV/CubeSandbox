@@ -73,6 +73,14 @@ permissions:
 env:
   BUILDER_IMAGE_REMOTE: ghcr.io/tencentcloud/cubesandbox-builder:ubuntu2004
   BUILDER_IMAGE_LOCAL: cube-sandbox-builder:ci
+  # riscv64 cross builder (ENABLE_RISCV64_CROSS=1). build-riscv64 COLD-BUILDS it by
+  # default -- self-contained: the musl.cc cross toolchain and the static
+  # libseccomp/libcap-ng (riscv64-musl) are compiled inside docker/Dockerfile.builder,
+  # so no published image is needed. Once publish-riscv64-builder.yml has pushed
+  # BUILDER_IMAGE_RISCV64_REMOTE and it is public, set the repo variable
+  # RISCV64_BUILDER_PULL_FIRST=true to pull it instead of cold-building.
+  BUILDER_IMAGE_RISCV64_REMOTE: ghcr.io/xuantie-rv/cubesandbox-builder:riscv64-cross
+  BUILDER_IMAGE_RISCV64_LOCAL: cube-sandbox-builder:riscv64-cross
 
 jobs:
   build:
@@ -251,16 +259,68 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Build RISC-V cross builder
+      - name: Detect builder input changes
+        id: builder_changes
         run: |
-          docker build \
-            --build-arg GITHUB_ACTIONS=true \
-            --build-arg ENABLE_RISCV64_CROSS=1 \
-            --build-arg BUILD_S3LVOL_DEPS=0 \
-            --build-arg RUSTUP_DIST_SERVER=https://static.rust-lang.org \
-            --build-arg RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup \
-            -t cube-sandbox-builder:riscv64-cross \
-            -f docker/Dockerfile.builder .
+          set -euo pipefail
+          # Rebuild (never pull a stale image) when the builder recipe or either
+          # builder-image workflow changed in this PR/push.
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base_ref="${{ github.event.pull_request.base.sha }}"
+            head_ref="${{ github.event.pull_request.head.sha }}"
+          else
+            base_ref="${{ github.event.before }}"
+            head_ref="${GITHUB_SHA}"
+          fi
+          if [[ -z "${base_ref}" || "${base_ref}" == "0000000000000000000000000000000000000000" ]]; then
+            changed_files="$(git diff-tree --no-commit-id --name-only -r "${head_ref}")"
+          else
+            changed_files="$(git diff --name-only "${base_ref}" "${head_ref}")"
+          fi
+          changed=false
+          while IFS= read -r f; do
+            case "${f}" in
+              docker/Dockerfile.builder \
+              |.github/workflows/build-builder-image.yml \
+              |.github/workflows/publish-riscv64-builder.yml)
+                changed=true; break ;;
+            esac
+          done <<< "${changed_files}"
+          echo "changed=${changed}" >> "${GITHUB_OUTPUT}"
+
+      - name: Prepare RISC-V cross builder (cold-build by default)
+        env:
+          PULL_FIRST: ${{ vars.RISCV64_BUILDER_PULL_FIRST }}
+        run: |
+          set -euo pipefail
+          # DEFAULT = self-contained cold build. `docker build` with
+          # ENABLE_RISCV64_CROSS=1 downloads the musl.cc riscv64 cross toolchain and
+          # cross-compiles the static libseccomp + libcap-ng (riscv64-musl) INSIDE the
+          # builder image (docker/Dockerfile.builder L262-307). No published GHCR image
+          # is required, so CI works out of the box.
+          build_local() {
+            docker build \
+              --build-arg GITHUB_ACTIONS=true \
+              --build-arg ENABLE_RISCV64_CROSS=1 \
+              --build-arg BUILD_S3LVOL_DEPS=0 \
+              --build-arg RUSTUP_DIST_SERVER=https://static.rust-lang.org \
+              --build-arg RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup \
+              -t "${BUILDER_IMAGE_RISCV64_LOCAL}" \
+              -f docker/Dockerfile.builder .
+          }
+          # OPTIONAL fast path: once ghcr.io/xuantie-rv/cubesandbox-builder:riscv64-cross
+          # is published AND public (see publish-riscv64-builder.yml), set the repo
+          # variable RISCV64_BUILDER_PULL_FIRST=true to pull it instead of cold-building.
+          # Always cold-build when the builder recipe itself changed in this PR/push.
+          changed="${{ steps.builder_changes.outputs.changed }}"
+          if [[ "${PULL_FIRST}" == "true" && "${changed}" != "true" ]] \
+             && docker pull "${BUILDER_IMAGE_RISCV64_REMOTE}"; then
+            echo "using published ${BUILDER_IMAGE_RISCV64_REMOTE}"
+            docker tag "${BUILDER_IMAGE_RISCV64_REMOTE}" "${BUILDER_IMAGE_RISCV64_LOCAL}"
+          else
+            echo "cold-building riscv64-cross builder image (musl toolchain + libseccomp/libcap-ng)"
+            build_local
+          fi
 
       - name: Cross-build RISC-V components
         run: make all-riscv64 RISCV64_BUILDER_IMAGE=cube-sandbox-builder:riscv64-cross SKIP_BUILDER_IMAGE_CHECK=1

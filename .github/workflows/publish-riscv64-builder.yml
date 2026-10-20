@@ -1,0 +1,110 @@
+name: Publish RISC-V Cross Builder Image
+
+# Builds the riscv64 cross builder image (docker/Dockerfile.builder with
+# ENABLE_RISCV64_CROSS=1) and pushes it to
+#   ghcr.io/xuantie-rv/cubesandbox-builder:riscv64-cross
+# so build-check.yml's build-riscv64 job can PULL it instead of cold-building the
+# toolchain (musl.cc cross gcc + static libseccomp/libcap-ng + Rust targets) on
+# every PR. Until this image is published (and public), build-riscv64 gracefully
+# falls back to a local build -- so landing that pull-first change first is safe.
+#
+# AUTH (important): this repository is NOT under the XUANTIE-RV GitHub org
+# (remotes are lkml-likexu/CubeSandbox and tencentcloud/CubeSandbox), so the
+# workflow GITHUB_TOKEN -- which is scoped to the running repo's own org -- CANNOT
+# push to ghcr.io/xuantie-rv. Publishing therefore needs a Personal Access Token
+# that (a) carries the `write:packages` scope and (b) belongs to an XUANTIE-RV
+# member. Store it as the repo/org secret XUANTIE_RV_GHCR_PAT. Without that secret
+# this job is skipped (not failed).
+#
+# VISIBILITY (one-time): a first push creates the package PRIVATE. Flip it to
+# PUBLIC once (ghcr Package settings -> Danger Zone -> Change visibility) so
+# build-check.yml can pull it anonymously; a private package would make the
+# pull-first step miss and silently fall back to a local build.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - main
+    paths:
+      - 'docker/Dockerfile.builder'
+      - '.github/workflows/publish-riscv64-builder.yml'
+
+concurrency:
+  group: publish-riscv64-builder-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_REPO: ghcr.io/xuantie-rv/cubesandbox-builder
+
+jobs:
+  publish:
+    name: Build + push riscv64-cross builder image
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Check publish credentials
+        id: creds
+        env:
+          PAT: ${{ secrets.XUANTIE_RV_GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${PAT}" ]]; then
+            echo "available=false" >> "${GITHUB_OUTPUT}"
+            echo "::warning::secret XUANTIE_RV_GHCR_PAT is not set -- skipping riscv64-cross publish (build-check.yml will fall back to a local build)"
+          else
+            echo "available=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.creds.outputs.available == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR (XUANTIE-RV via PAT)
+        if: steps.creds.outputs.available == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          # GHCR authenticates via the token; the username is the PAT owner's
+          # handle (github.actor for a dispatch/push by that user).
+          username: ${{ github.actor }}
+          password: ${{ secrets.XUANTIE_RV_GHCR_PAT }}
+
+      - name: Compute image tags
+        if: steps.creds.outputs.available == 'true'
+        id: tags
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::7}"
+          {
+            echo "tags<<EOF"
+            echo "${IMAGE_REPO}:riscv64-cross"
+            echo "${IMAGE_REPO}:riscv64-cross-sha-${short_sha}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+          echo "will tag: ${IMAGE_REPO}:riscv64-cross , ${IMAGE_REPO}:riscv64-cross-sha-${short_sha}"
+
+      - name: Build and push
+        if: steps.creds.outputs.available == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.builder
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            GITHUB_ACTIONS=true
+            ENABLE_RISCV64_CROSS=1
+            BUILD_S3LVOL_DEPS=0
+            RUSTUP_DIST_SERVER=https://static.rust-lang.org
+            RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup
+          cache-from: type=gha,scope=builder-riscv64-cross
+          cache-to: type=gha,mode=max,scope=builder-riscv64-cross

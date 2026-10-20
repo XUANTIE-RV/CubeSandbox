@@ -25,6 +25,13 @@ env:
   KERNEL_ARCHIVE_URL: https://cnb.cool/CubeSandbox/OpenCloudOS-Kernel/-/git/archive/6.6.119-49.6.zip
   PVM_KERNEL_TAG: 6.6.117-45.16.cubesandbox
   PVM_VMLINUX_CACHE_PATH: kernel-cache/vmlinux-pvm
+  # riscv64 guest kernel: mainline Linux 7.2 (kernel.org ships source only, no
+  # prebuilt riscv64 Image), cross-built here with the two out-of-tree CubeSandbox
+  # patches (configs/patches/riscv64-*.patch) and published as `vmlinux-riscv64`.
+  # configs/kernel-oc9.riscv64.config already carries CONFIG_KVM=y, so the single
+  # Image serves BOTH the C1 nested L1 host kernel (needs /dev/kvm) and the L2 guest.
+  RISCV64_KERNEL_TAG: "7.2"
+  RISCV64_KERNEL_ARCHIVE_URL: https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.tar.xz
 
 defaults:
   run:
@@ -332,6 +339,100 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  build_riscv64_guest:
+    name: Build riscv64 guest vmlinux (Linux 7.2)
+    needs: ensure_release
+    runs-on: arc-runner-set-16c32g-containerd
+    container:
+      image: ubuntu:24.04
+    env:
+      VMLINUX_CACHE_PATH: kernel-cache/riscv64/vmlinux
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute vmlinux cache metadata
+        id: riscv64_metadata
+        run: |
+          set -euo pipefail
+          source_hash="$(
+            sha256sum \
+              configs/kernel-oc9.riscv64.config \
+              configs/patches/riscv64-dax-zeropage-folio.patch \
+              configs/patches/riscv64-kvm-zeropage-dirtylog.patch \
+              scripts/build-kernel.sh \
+              hypervisor/scripts/build_guest_kernel_riscv64.sh \
+              | sha256sum \
+              | awk '{print $1}'
+          )"
+          echo "cache_key=vmlinux-riscv64-linux-${RISCV64_KERNEL_TAG}-${source_hash}-ubuntu-latest" >> "${GITHUB_OUTPUT}"
+
+      - name: Install kernel build dependencies
+        run: |
+          apt-get update
+          apt-get install -y file sudo build-essential git bc bison flex \
+            libelf-dev libssl-dev libncurses-dev dwarves cpio kmod \
+            fakeroot rsync dpkg-dev debhelper wget curl ca-certificates python3 \
+            xz-utils patch gcc-riscv64-linux-gnu
+
+      - name: Restore cached vmlinux
+        id: restore_riscv64_vmlinux
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.VMLINUX_CACHE_PATH }}
+          key: ${{ steps.riscv64_metadata.outputs.cache_key }}
+
+      - name: Build riscv64 guest vmlinux (in-place via shared script)
+        if: steps.restore_riscv64_vmlinux.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          chmod +x hypervisor/scripts/build_guest_kernel_riscv64.sh
+          # Fetch the v7.2 source -> apply the two CubeSandbox patches -> cross-compile
+          # the PE/EFI-stub Image -> install to the cache path. This is the SAME shared
+          # implementation 件 4 (riscv64-snapshot-integration.yml) uses to build the
+          # guest kernel in-place, so the released asset and the CI-tested kernel are
+          # byte-for-byte the same build recipe.
+          KERNEL_SRC_URL="${RISCV64_KERNEL_ARCHIVE_URL}" \
+          OUTPUT_IMAGE="${VMLINUX_CACHE_PATH}" \
+          WORK_DIR="${GITHUB_WORKSPACE}/riscv64-guest-build" \
+          KERNEL_BUILD_JOBS="$(nproc)" \
+            bash hypervisor/scripts/build_guest_kernel_riscv64.sh
+
+      - name: Verify vmlinux (PE/EFI-stub Image)
+        run: |
+          set -euo pipefail
+          test -f "${VMLINUX_CACHE_PATH}"
+          file "${VMLINUX_CACHE_PATH}"
+          magic="$(head -c2 "${VMLINUX_CACHE_PATH}" | tr -d '\0')"
+          if [[ "${magic}" != "MZ" ]]; then
+            echo "riscv64 Image is not a PE/EFI-stub image (magic='${magic}', expected 'MZ')" >&2
+            exit 1
+          fi
+          echo "PE magic MZ OK ($(stat -c%s "${VMLINUX_CACHE_PATH}") bytes)"
+
+      - name: Save vmlinux cache
+        if: steps.restore_riscv64_vmlinux.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.VMLINUX_CACHE_PATH }}
+          key: ${{ steps.riscv64_metadata.outputs.cache_key }}
+
+      - name: Stage riscv64 release asset
+        run: |
+          rm -rf riscv64-release-assets
+          mkdir -p riscv64-release-assets
+          install -D -m 0644 "${VMLINUX_CACHE_PATH}" \
+            riscv64-release-assets/vmlinux-riscv64
+
+      - name: Upload riscv64 vmlinux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-riscv64
+          path: riscv64-release-assets/vmlinux-riscv64
+          if-no-files-found: error
+          retention-days: 14
+
   publish:
     name: Upload kernel assets to Release
     needs:
@@ -340,6 +441,7 @@ jobs:
       - build_pvm_guest
       - build_pvm_host_deb
       - build_pvm_host_rpm
+      - build_riscv64_guest
     runs-on: ubuntu-latest
     steps:
       - name: Download all kernel artifacts
@@ -357,6 +459,12 @@ jobs:
           test -f kernel-release-assets/vmlinux-amd64
           test -f kernel-release-assets/vmlinux-arm64
           test -f kernel-release-assets/vmlinux-pvm-amd64
+          test -f kernel-release-assets/vmlinux-riscv64
+          riscv_magic="$(head -c2 kernel-release-assets/vmlinux-riscv64 | tr -d '\0')"
+          if [[ "${riscv_magic}" != "MZ" ]]; then
+            echo "vmlinux-riscv64 is not a PE/EFI-stub Image (magic='${riscv_magic}')" >&2
+            exit 1
+          fi
 
           has_rpm=0
           has_deb=0
@@ -405,6 +513,10 @@ jobs:
               "pvm": {
                   "source_tag": os.environ["PVM_KERNEL_TAG"],
               },
+              "riscv64_guest": {
+                  "source_tag": os.environ["RISCV64_KERNEL_TAG"],
+                  "archive_url": os.environ["RISCV64_KERNEL_ARCHIVE_URL"],
+              },
           }
           path = "kernel-release-assets/kernel-metadata.json"
           with open(path, "w", encoding="utf-8") as f:
@@ -425,6 +537,7 @@ jobs:
             kernel-release-assets/vmlinux-amd64
             kernel-release-assets/vmlinux-arm64
             kernel-release-assets/vmlinux-pvm-amd64
+            kernel-release-assets/vmlinux-riscv64
             kernel-release-assets/*.deb
             kernel-release-assets/*.rpm
           )
