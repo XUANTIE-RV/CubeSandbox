@@ -123,7 +123,7 @@ fi
 
 # --- 9p share: assets + binaries + integration script handed to the L1 -------
 SHARE="${RUNDIR}/share"; mkdir -p "${SHARE}"
-cp -f "${WORKLOADS_DIR}"/{Image,cube-guest-image-cpu.img,cube-agent.ext4,cube-spec.json,cube-spec-restore.json,cube-min.tar} "${SHARE}/"
+cp -f "${WORKLOADS_DIR}"/{Image,fw_dynamic.bin,cube-guest-image-cpu.img,cube-agent.ext4,cube-spec.json,cube-spec-restore.json,cube-min.tar} "${SHARE}/"
 cp -f "${BIN_DIR}"/{cube-runtime-riscv64,containerd-shim-cube-rs-riscv64,cube-agent-riscv64,cube-init-riscv64} "${SHARE}/"
 cp -f "${INTEGRATION}" "${SHARE}/run_integration_tests_riscv64.sh"
 # vmlinux is the name the shim expects for cube-kernel-scf/vmlinux.
@@ -167,7 +167,7 @@ ${SSH} 'sudo bash -c "
   mountpoint -q /data || mount /dev/vdb /data 2>/dev/null || true
   export WORKLOADS_DIR=/mnt/share
   # stage the assets where run_integration_tests_riscv64.sh expects them
-  cp -f /mnt/share/Image /mnt/share/vmlinux /mnt/share/cube-*.img /mnt/share/cube-*.ext4 /mnt/share/cube-*.json /mnt/share/cube-min.tar /mnt/share/*-riscv64 /data/ 2>/dev/null || true
+  cp -f /mnt/share/Image /mnt/share/vmlinux /mnt/share/fw_dynamic.bin /mnt/share/cube-*.img /mnt/share/cube-*.ext4 /mnt/share/cube-*.json /mnt/share/cube-min.tar /mnt/share/*-riscv64 /data/ 2>/dev/null || true
   chmod +x /mnt/share/run_integration_tests_riscv64.sh
   # The integration script resolves REPO from its own path (/mnt/share), so its
   # default OUTPUT_BIN=/mnt/_output/bin never exists; the binaries live in /data.
