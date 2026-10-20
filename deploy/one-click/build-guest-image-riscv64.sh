@@ -19,6 +19,9 @@
 #   /etc/hostname   # "localhost"
 #   /cube-root/     # empty skeleton; the OCI container (cube-min.tar) rootfs
 #                   #   is unpacked here at runtime (cube-spec root.path)
+#   /cube-root/usr/bin/l2pause
+#                   # optional static pause binary (ONE_CLICK_L2PAUSE_BIN);
+#                   #   the snapshot/restore integration's container entrypoint
 #   /bin /dev /lib /proc /root /run /sys /tmp /usr /var  # empty mount points
 #
 # Block size is FORCED to 4096: CubeShim boots the guest kernel with
@@ -30,6 +33,7 @@
 # Usage:
 #   OUTPUT_DIR=/path/to/cube-image \
 #     [ONE_CLICK_CUBE_INIT_BIN=/path/to/cube-init-riscv64] \
+#     [ONE_CLICK_L2PAUSE_BIN=/path/to/l2pause-riscv64] \
 #     [ONE_CLICK_GUEST_IMAGE_TAR=/path/to/cube-guest-image-riscv64.tar.gz] \
 #     [CUBE_VERSION=v0.7.2] ./deploy/one-click/build-guest-image-riscv64.sh
 #
@@ -130,6 +134,17 @@ mkdir -p \
 
 install -m 0755 "${INIT_BIN}" "${GUEST_ROOTFS_DIR}/sbin/init"
 [[ -x "${GUEST_ROOTFS_DIR}/sbin/init" ]] || die "failed to install /sbin/init"
+
+# Optional l2pause: the snapshot/restore integration's container entrypoint
+# (cube-spec args /usr/bin/l2pause). The OCI image (cube-min.tar) is a
+# vestigial empty layer whose content never reaches the guest, so the
+# entrypoint must live in the mini-rootfs itself. Same static-ELF requirement
+# as /sbin/init: the rootfs ships no loader.
+if [[ -n "${ONE_CLICK_L2PAUSE_BIN:-}" ]]; then
+  verify_static_riscv64_init "${ONE_CLICK_L2PAUSE_BIN}"
+  mkdir -p "${GUEST_ROOTFS_DIR}/cube-root/usr/bin"
+  install -m 0755 "${ONE_CLICK_L2PAUSE_BIN}" "${GUEST_ROOTFS_DIR}/cube-root/usr/bin/l2pause"
+fi
 
 printf 'localhost\n' > "${GUEST_ROOTFS_DIR}/etc/hostname"
 printf '127.0.0.1 localhost\n' > "${GUEST_ROOTFS_DIR}/etc/hosts"

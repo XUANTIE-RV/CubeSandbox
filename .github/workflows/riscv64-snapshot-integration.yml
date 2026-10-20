@@ -86,6 +86,9 @@ jobs:
           # cube-agent, cube-init, ...). SKIP_BUILDER_IMAGE_CHECK lets a runner
           # with a prebuilt builder image reuse it.
           make all-riscv64 SKIP_BUILDER_IMAGE_CHECK=1 || make all-riscv64
+          # l2pause: the L2 container entrypoint baked into the guest image below
+          # (cube-spec args /usr/bin/l2pause; the cube-min.tar layer is empty).
+          make l2pause-riscv64 SKIP_BUILDER_IMAGE_CHECK=1 || make l2pause-riscv64
 
       - name: Build 7.2 guest kernel Image (in-place, cross-compiled)
         run: |
@@ -111,8 +114,11 @@ jobs:
           set -euo pipefail
           chmod +x deploy/one-click/build-guest-image-riscv64.sh deploy/one-click/build-agent-ext4.sh
           # cube-guest-image-cpu.img: the L2 guest rootfs (/sbin/init = cube-init).
+          # ONE_CLICK_L2PAUSE_BIN bakes /usr/bin/l2pause into /cube-root (the
+          # integration's container entrypoint).
           OUTPUT_DIR="${WORKLOADS_DIR}" \
             ONE_CLICK_CUBE_INIT_BIN="${GITHUB_WORKSPACE}/_output/bin/cube-init-riscv64" \
+            ONE_CLICK_L2PAUSE_BIN="${GITHUB_WORKSPACE}/_output/bin/l2pause-riscv64" \
             ./deploy/one-click/build-guest-image-riscv64.sh
           # cube-agent.ext4: the cube-agent pmem1 payload.
           OUTPUT_DIR="${WORKLOADS_DIR}" \

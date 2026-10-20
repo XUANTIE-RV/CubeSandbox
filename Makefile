@@ -678,6 +678,16 @@ shim-riscv64: riscv64-builder-image
 	@mkdir -p "$(OUTPUT_DIR)"
 	$(MAKE) builder-run BUILDER_CMD='cd /workspace/CubeShim && rustup target add riscv64gc-unknown-linux-musl --toolchain 1.85 && LIBSECCOMP_LINK_TYPE=static LIBSECCOMP_LIB_PATH=/usr/local/riscv64-linux-musl/libseccomp/lib LIBCAPNG_LINK_TYPE=static LIBCAPNG_LIB_PATH=/usr/local/riscv64-linux-musl/libcap-ng/lib CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_MUSL_LINKER=riscv64-linux-musl-gcc RUSTFLAGS=-Ctarget-feature=+crt-static cargo +1.85 build --release --locked --target riscv64gc-unknown-linux-musl && install -m 0755 target/riscv64gc-unknown-linux-musl/release/containerd-shim-cube-rs /workspace/_output/bin/containerd-shim-cube-rs-riscv64 && install -m 0755 target/riscv64gc-unknown-linux-musl/release/cube-runtime /workspace/_output/bin/cube-runtime-riscv64'
 
+# l2pause: static riscv64 pause binary, the L2 container entrypoint
+# (/usr/bin/l2pause) of the C1 snapshot/restore integration. Installed into
+# the guest image by deploy/one-click/build-guest-image-riscv64.sh when
+# ONE_CLICK_L2PAUSE_BIN points at the built binary.
+.PHONY: l2pause-riscv64
+l2pause-riscv64: export BUILDER_IMAGE := $(RISCV64_BUILDER_IMAGE)
+l2pause-riscv64: riscv64-builder-image
+	@mkdir -p "$(OUTPUT_DIR)"
+	$(MAKE) builder-run BUILDER_CMD='riscv64-linux-musl-gcc -static -no-pie -Os -o /workspace/_output/bin/l2pause-riscv64 /workspace/hypervisor/scripts/l2pause.c'
+
 # Build a guest kernel image (vmlinux for x86_64, Image for aarch64/riscv64) from an external kernel source tree.
 #   make guest-kernel KERNEL_SRC=/path/to/linux                            # native build for the host arch
 #   make guest-kernel KERNEL_SRC=/path/to/linux KERNEL_TARGET_ARCH=aarch64 # cross build
