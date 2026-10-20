@@ -21,6 +21,9 @@ WORKDIR /workspace
 
 COPY CubeShim/ /workspace/CubeShim/
 COPY hypervisor/ /workspace/hypervisor/
+# CubeShim's workspace path-depends on the vendored containerd-shim crate
+# (CubeShim/Cargo.toml -> ../third_party/containerd-shim).
+COPY third_party/containerd-shim/ /workspace/third_party/containerd-shim/
 
 # Same as root Makefile `shim`: cargo build --release --locked in CubeShim.
 RUN set -eux; \

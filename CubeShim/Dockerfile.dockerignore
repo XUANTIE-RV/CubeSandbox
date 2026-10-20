@@ -11,6 +11,11 @@ CubeShim/target/**
 !hypervisor/**
 hypervisor/target
 hypervisor/target/**
+!third_party
+!third_party/containerd-shim
+!third_party/containerd-shim/**
+third_party/containerd-shim/target
+third_party/containerd-shim/target/**
 !deploy
 !deploy/one-click
 !deploy/one-click/config-cube.toml
