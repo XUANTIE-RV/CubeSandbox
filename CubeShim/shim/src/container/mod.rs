@@ -242,7 +242,13 @@ impl Container {
             log,
             sb_conf,
             info,
-            ctx: context::with_timeout(1000 * 1000 * 1000 * 10),
+            // Agent ttrpc context timeout for container-scoped calls. Same
+            // rationale as the sandbox ctx (sb.rs): under emulation (riscv64
+            // TCG, nested KVM) create_container's guest-side rustjail spawn
+            // routinely exceeds 10s, surfacing as
+            // "create container failed: ttrpc err: Receive packet timeout".
+            // 30s still fails fast on a genuinely dead agent.
+            ctx: context::with_timeout(1000 * 1000 * 1000 * 30),
             state: None,
             execs: Arc::new(Mutex::new(HashMap::new())),
             tx_containerd,
