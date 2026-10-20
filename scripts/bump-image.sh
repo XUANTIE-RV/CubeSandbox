@@ -265,8 +265,11 @@ do_check() {
 			"${grep_args[@]}" . 2>/dev/null || true)"
 	fi
 	# Drop references that are intentionally version-pinned fixtures/history.
+	# build.env.riscv64 pins CUBE_VERSION to minCoordinatedSnapshotShimVersion
+	# for tag-less dev checkouts (see the file header); it is a floor, not the
+	# release tag, so it must not track bump-image rewrites.
 	matches="$(printf '%s\n' "$matches" |
-		grep -vE '(_test\.go|/tests/|/mocks/|/changelog/)' || true)"
+		grep -vE '(_test\.go|/tests/|/mocks/|/changelog/|build\.env\.riscv64)' || true)"
 
 	local line tag
 	while IFS= read -r line; do
