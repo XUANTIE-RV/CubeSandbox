@@ -162,6 +162,7 @@ ${SSH} 'test -e /dev/kvm' || die "L1 has no /dev/kvm -- QEMU H-extension not exp
 
 # --- run the integration test INSIDE the L1 (nested KVM) ---------------------
 info "running snapshot/restore integration inside the L1"
+set +e
 ${SSH} 'sudo bash -c "
   mountpoint -q /mnt/share || { mkdir -p /mnt/share && mount -t 9p -o trans=virtio,version=9p2000.L c1share /mnt/share; }
   mountpoint -q /data || mount /dev/vdb /data 2>/dev/null || true
@@ -173,7 +174,10 @@ ${SSH} 'sudo bash -c "
   # default OUTPUT_BIN=/mnt/_output/bin never exists; the binaries live in /data.
   WORKLOADS_DIR=/data OUTPUT_BIN=/data bash /mnt/share/run_integration_tests_riscv64.sh --quick
 "' 2>&1 | tee "${RUNDIR}/integration.log"
+# Without set +e, pipefail aborts at the pipeline above on integration failure,
+# making the rc capture and the log assertions below dead code.
 rc=${PIPESTATUS[0]}
+set -e
 
 info "integration rc=${rc}"
 echo "=== restore/corruption assertions ==="
