@@ -49,6 +49,13 @@ die()  { echo "[c1] ERROR: $*" >&2; exit 2; }
 command -v "${QEMU}" >/dev/null 2>&1 || die "qemu-system-riscv64 not found (set QEMU=)"
 command -v qemu-img >/dev/null 2>&1 || die "qemu-img not found"
 
+qemu_maj="$("${QEMU}" --version | sed -n 's/.*version \([0-9]\+\).*/\1/p' | head -1)"
+if [ -n "${qemu_maj}" ] && [ "${qemu_maj}" -lt 11 ]; then
+  info "WARN: ${QEMU} is qemu ${qemu_maj}.x -- qemu < 11 TCG IMSIC/AIA is broken for the nested"
+  info "      7.2 L1 (KVM_CAP_IRQCHIP never reported; shim panics at check_required_extensions)."
+  info "      Build community qemu 11 with hypervisor/scripts/build_qemu_riscv64.sh."
+fi
+
 # --- preflight: required assets ---------------------------------------------
 for a in Image fw_dynamic.bin cube-guest-image-cpu.img cube-agent.ext4 \
          cube-spec.json cube-spec-restore.json cube-min.tar; do

@@ -14,16 +14,25 @@ name: RISC-V Snapshot Integration
 # hypervisor/scripts/run_c1_nested_riscv64.sh (the CI codification of the
 # hand-validated cube-72-snap-bed testbed).
 #
-# GUEST KERNEL: built IN-PLACE by build_guest_kernel_riscv64.sh (fetch kernel.org
-# v7.2 source -> apply the two CubeSandbox patches -> cross-compile the PE Image).
-# Building from source+patches every run GUARANTEES the KVM dirty-log backport
-# (configs/patches/riscv64-kvm-zeropage-dirtylog.patch) is present: without it the
-# KVM dirty-log fast path lets the L2 write through a read-only ZERO_PAGE G-stage
-# leaf into the L1's empty_zero_page at -smp>1, corrupting every fresh anon page in
-# the L1 (Go "arena already initialized" / awk segfault). With it, -smp>1 is safe;
-# RISCV64_L1_SMP defaults to 4 (set 1 to sidestep entirely). No 件 0 Release asset
-# and no CUBE_RISCV64_ASSET_BASE variable are required -- opensbi fw_dynamic and the
-# Ubuntu rootfs are wget'd from official public sources by fetch_guest_assets_riscv64.sh.
+# ALIGNED ENVIRONMENT (all three legs pinned to upstream/community sources):
+#   kernel : kernel.org v7.2 + configs/patches/{riscv64-dax-zeropage-folio,
+#            riscv64-kvm-zeropage-dirtylog}, built IN-PLACE by
+#            build_guest_kernel_riscv64.sh (same two patches as yocto
+#            linux-xuantie_7.2.bb). Building from source+patches every run
+#            GUARANTEES the KVM dirty-log backport is present: without it the
+#            KVM dirty-log fast path lets the L2 write through a read-only
+#            ZERO_PAGE G-stage leaf into the L1's empty_zero_page at -smp>1,
+#            corrupting every fresh anon page in the L1 (Go "arena already
+#            initialized" / awk segfault). RISCV64_L1_SMP defaults to 4.
+#   qemu   : community 11.x, built from the qemu.org source release by
+#            build_qemu_riscv64.sh (actions/cache'd). The distro qemu is NOT
+#            usable: ubuntu-24.04's apt qemu 8.2.2 has broken TCG IMSIC/AIA --
+#            inside the L1 the 7.2 kernel never completes kvm_riscv_aia_init()
+#            ("AIA available" never prints), /dev/kvm reports KVM_CAP_IRQCHIP=0,
+#            and the shim panics at check_required_extensions.
+#   opensbi: community v1.7 release fw_dynamic.bin, wget'd by
+#            fetch_guest_assets_riscv64.sh (together with the Ubuntu rootfs).
+# No 件 0 Release asset and no CUBE_RISCV64_ASSET_BASE variable are required.
 
 on:
   pull_request:
@@ -49,6 +58,7 @@ permissions:
 
 env:
   WORKLOADS_DIR: ${{ github.workspace }}/workloads
+  QEMU_VERSION: '11.1.1'
 
 jobs:
   snapshot-restore-c1:
@@ -61,23 +71,38 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install QEMU + guest tooling + riscv64 kernel cross toolchain
+      - name: Install guest tooling + riscv64 kernel cross toolchain
         run: |
           set -euo pipefail
           sudo apt-get update
-          # qemu-system-misc provides qemu-system-riscv64 (ubuntu-24.04: qemu 8.2,
-          # which supports -cpu max H-extension + aia=aplic-imsic); qemu-utils for
-          # qemu-img; cloud-image-utils for cloud-localds (NoCloud seed); mtools as
-          # a seed fallback; e2fsprogs for the guest-image/agent ext4 builders.
+          # qemu-system-riscv64 deliberately NOT installed from apt: noble ships
+          # qemu 8.2.2 whose TCG IMSIC/AIA is broken for the nested L1 (see the
+          # header). The community qemu 11 used for the L1 is built from source
+          # by build_qemu_riscv64.sh below. Here: qemu-utils for qemu-img;
+          # cloud-image-utils for cloud-localds (NoCloud seed); mtools as a
+          # seed fallback; e2fsprogs for the guest-image/agent ext4 builders.
           # gcc-riscv64-linux-gnu + the kernel build deps cross-compile the 7.2
           # guest Image in-place (build_guest_kernel_riscv64.sh -> build-kernel.sh).
           sudo apt-get install -y \
-            qemu-system-misc qemu-utils cloud-image-utils mtools e2fsprogs \
+            qemu-utils cloud-image-utils mtools e2fsprogs \
             openssh-client btrfs-progs \
             gcc-riscv64-linux-gnu build-essential bc bison flex libelf-dev \
             libssl-dev libncurses-dev dwarves cpio kmod rsync xz-utils patch
-          qemu-system-riscv64 --version | head -1
           riscv64-linux-gnu-gcc --version | head -1
+
+      - name: Cache community QEMU ${{ env.QEMU_VERSION }} build
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WORKLOADS_DIR }}/qemu-install
+          key: qemu-${{ env.QEMU_VERSION }}-riscv64-softmmu-1
+
+      - name: Build community QEMU ${{ env.QEMU_VERSION }} (qemu-system-riscv64 only)
+        run: |
+          set -euo pipefail
+          chmod +x hypervisor/scripts/build_qemu_riscv64.sh
+          # -> ${WORKLOADS_DIR}/qemu-install/bin/qemu-system-riscv64.
+          # Idempotent: a cache hit on qemu-install skips the build entirely.
+          hypervisor/scripts/build_qemu_riscv64.sh
 
       - name: Build riscv64 components
         run: |
@@ -140,6 +165,9 @@ jobs:
           L1_SMP: ${{ vars.RISCV64_L1_SMP || '4' }}
           L1_MEM: ${{ vars.RISCV64_L1_MEM || '4G' }}
           RUNDIR: ${{ runner.temp }}/c1-l1
+          # The community qemu 11 built above -- NOT the distro qemu (8.2.2's
+          # broken TCG IMSIC/AIA would panic the shim at check_required_extensions).
+          QEMU: ${{ env.WORKLOADS_DIR }}/qemu-install/bin/qemu-system-riscv64
         run: |
           set -euo pipefail
           chmod +x hypervisor/scripts/run_c1_nested_riscv64.sh \
