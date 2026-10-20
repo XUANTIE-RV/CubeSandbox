@@ -247,9 +247,7 @@ RUN set -eux; \
         rustup toolchain install "${toolchain}" --profile minimal; \
         rustup component add rust-src clippy rustfmt rust-analyzer llvm-tools-preview --toolchain "${toolchain}"; \
         rustup target add ${RUST_ARCH}-unknown-linux-gnu --toolchain "${toolchain}"; \
-        if rustup target list --toolchain "${toolchain}" | grep -q "^${RUST_ARCH}-unknown-linux-musl "; then \
-            rustup target add ${RUST_ARCH}-unknown-linux-musl --toolchain "${toolchain}"; \
-        fi; \
+        rustup target add ${RUST_ARCH}-unknown-linux-musl --toolchain "${toolchain}"; \
     done; \
     if [ "${ENABLE_RISCV64_CROSS}" = 1 ] && [ "${RUST_ARCH}" != riscv64gc ]; then \
         for toolchain in "${RUST_TOOLCHAIN_E2BAPI}" "${RUST_TOOLCHAIN_AGENT}"; do \
