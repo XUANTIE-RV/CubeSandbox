@@ -136,6 +136,16 @@ cp -f "${KERNEL}" "${TB}/cube-kernel-scf/vmlinux"          # filename vmlinux, c
 # pmem0 guest OS image + pmem1 cube-agent.ext4 were built (or prestaged) in 0b.
 cp -f "${GUEST_OS_IMAGE}" "${TB}/cube-image/cube-guest-image-cpu.img"
 cp -f "${CUBE_AGENT_EXT4}" "${TB}/cube-agent/cube-agent.ext4"
+# Asset version files: the snapshot metadata writer (Utils::get_*_version) and
+# the restore-side SnapshotInfo eq() both read <asset-dir>/version next to each
+# toolbox asset; the production toolbox ships them, so stage them here too.
+for d in cube-kernel-scf cube-image cube-agent; do
+  if [[ -s "${WORKLOADS_DIR}/version" ]]; then
+    cp -f "${WORKLOADS_DIR}/version" "${TB}/${d}/version"
+  else
+    echo "0.0.0-dev" > "${TB}/${d}/version"
+  fi
+done
 
 # --- 2) start a standalone containerd-cube (no systemd on the runner) -------
 info "start standalone containerd-cube"
@@ -156,14 +166,19 @@ ctr --address "${SOCK}" -n default run -d --rootfs --runtime io.containerd.cube.
     -c "${SPEC}" "${SANDBOX_ID}" || die "ctr run failed (spec=${SPEC})"
 
 info "assert VsockServerReady + task RUNNING (boot timeout ${BOOT_TIMEOUT}s)"
+# The shim wires the L2 serial console as ConsoleOutputMode::Tty (hypervisor/
+# config.rs), so ${SERIAL} never gains content; the guest readiness signal is
+# the guest-init sys-ctrl write the VMM logs as "vsock server ready" in
+# ${VMM_LOG}. Accept either source.
+VMM_LOG="${VMM_LOG:-/data/log/CubeVmm/vmm.log}"
 ready=0
 for _ in $(seq 1 "${BOOT_TIMEOUT}"); do
-  grep -qi "VsockServerReady" "${SERIAL}" 2>/dev/null && { ready=1; break; }
+  { grep -qi "VsockServerReady" "${SERIAL}" 2>/dev/null || grep -qi "vsock server ready" "${VMM_LOG}" 2>/dev/null; } && { ready=1; break; }
   sleep 1
 done
 state="$(ctr --address "${SOCK}" -n default task ls 2>/dev/null | awk -v id="${SANDBOX_ID}" '$1==id{print $3}')"
-[[ "${ready}" == "1" ]] || { ctr --address "${SOCK}" -n default task kill -s SIGKILL "${SANDBOX_ID}" 2>/dev/null || true; die "VsockServerReady not seen in ${SERIAL} (task state=${state:-?})"; }
-echo "  boot: VsockServerReady OK, task state=${state:-RUNNING}"
+[[ "${ready}" == "1" ]] || { ctr --address "${SOCK}" -n default task kill -s SIGKILL "${SANDBOX_ID}" 2>/dev/null || true; die "vsock server ready not seen in ${SERIAL} or ${VMM_LOG} (task state=${state:-?})"; }
+echo "  boot: vsock server ready OK, task state=${state:-RUNNING}"
 
 # --- 3b) dax assertion (riscv64 7.2 FS_DAX) ---------------------------------
 # The root pmem boots with rootflags=dax (CubeShim config.rs::new) and both the
@@ -172,13 +187,13 @@ echo "  boot: VsockServerReady OK, task state=${state:-RUNNING}"
 # ext4 accepts the dax option and logs "DAX enabled"; a 6.6 guest would reject it
 # with EINVAL. A rejection is a hard failure (proves the kernel lacks FS_DAX);
 # absence of a positive line is only a warning (console may route to hvc0).
-if grep -qiE "dax.*(EINVAL|failed|not supported)|EINVAL.*dax" "${SERIAL}" 2>/dev/null; then
+if grep -qiE "dax.*(EINVAL|failed|not supported)|EINVAL.*dax" "${SERIAL}" "${VMM_LOG}" 2>/dev/null; then
   die "guest kernel REJECTED the dax mount option -- FS_DAX missing; riscv64 needs the 7.2 guest kernel"
 fi
-if grep -qiE "DAX enabled|,dax|dax " "${SERIAL}" 2>/dev/null; then
+if grep -qiE "DAX enabled|,dax|dax " "${SERIAL}" "${VMM_LOG}" 2>/dev/null; then
   echo "  dax: guest kernel accepted the dax mount option (FS_DAX present)"
 else
-  echo "  dax: WARNING -- no positive dax line in ${SERIAL} (console may route to hvc0); not fatal"
+  echo "  dax: WARNING -- no positive dax line in ${SERIAL}/${VMM_LOG} (console may route to hvc0); not fatal"
 fi
 
 # --- 4) snapshot -> restore -> verify (the P4/P5 equivalent) ----------------
@@ -208,8 +223,17 @@ case "${SNAPSHOT_MODE:-shim}" in
     RESTORE_ID="restore-${SANDBOX_ID}"
     ctr --address "${SOCK}" -n default run -d --rootfs --runtime io.containerd.cube.rs \
         -c "${SPEC_RESTORE}" "${RESTORE_ID}" || die "restore ctr run failed (spec=${SPEC_RESTORE})"
-    for _ in $(seq 1 "${BOOT_TIMEOUT}"); do grep -qi "VsockServerReady" "${SERIAL%.log}-restore.log" 2>/dev/null && break; sleep 1; done
-    echo "  restore: booted ${RESTORE_ID}; verify marker='${MARKER}' + mem var via agent exec (TODO on runner)"
+    # Hard pass signal is the restored task reaching RUNNING; the per-sandbox
+    # serial file is never written (serial is ConsoleOutputMode::Tty), so poll
+    # containerd instead of grepping a nonexistent log.
+    rstate=""
+    for _ in $(seq 1 "${BOOT_TIMEOUT}"); do
+      rstate="$(ctr --address "${SOCK}" -n default task ls 2>/dev/null | awk -v id="${RESTORE_ID}" '$1==id{print $3}')"
+      [[ "${rstate}" == "RUNNING" ]] && break
+      sleep 1
+    done
+    [[ "${rstate}" == "RUNNING" ]] || die "restored sandbox ${RESTORE_ID} did not reach RUNNING (state=${rstate:-?})"
+    echo "  restore: ${RESTORE_ID} RUNNING; verify marker='${MARKER}' + mem var via agent exec (TODO on runner)"
     ;;
   *) die "unknown SNAPSHOT_MODE=${SNAPSHOT_MODE} (expected: shim|demo)" ;;
 esac
