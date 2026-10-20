@@ -153,7 +153,9 @@ pub fn check_required_kvm_extensions(kvm: &Kvm) -> KvmResult<()> {
     // SetGuestDebug is required but some kernels have it implemented without the capability flag.
     check_extension!(Cap::ImmediateExit);
     check_extension!(Cap::Ioeventfd);
-    check_extension!(Cap::Irqchip);
+    // KVM_CAP_IRQCHIP is not listed: it gates KVM_CREATE_IRQCHIP, which
+    // riscv64 KVM never implements (the in-kernel vAIA is created with
+    // KVM_CREATE_DEVICE), so upstream kernels always report it as 0.
     check_extension!(Cap::Irqfd);
     check_extension!(Cap::IrqRouting);
     check_extension!(Cap::MpState);
