@@ -98,7 +98,8 @@ fn icc_attr_get(gic: &DeviceFd, offset: u64, typer: u64) -> Result<u32> {
         addr: &mut val as *mut u64 as u64,
         flags: 0,
     };
-    gic.get_device_attr(&mut gic_icc_attr).map_err(|e| {
+    // SAFETY: the buffer is a live local `mut` with the size the attr group expects.
+    unsafe { gic.get_device_attr(&mut gic_icc_attr) }.map_err(|e| {
         Error::GetDeviceAttribute(HypervisorDeviceError::GetDeviceAttribute(e.into()))
     })?;
     u32::try_from(val).map_err(|_| {

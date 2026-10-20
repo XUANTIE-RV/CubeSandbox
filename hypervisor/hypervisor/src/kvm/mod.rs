@@ -67,7 +67,7 @@ use crate::{
     USER_MEMORY_REGION_LOG_DIRTY, USER_MEMORY_REGION_READ, USER_MEMORY_REGION_WRITE,
 };
 #[cfg(target_arch = "aarch64")]
-use aarch64::{RegList, Register, StandardRegisters};
+use aarch64::Register;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
     kvm_enable_cap, kvm_msr_entry, MsrList, KVM_CAP_HYPERV_SYNIC, KVM_CAP_SPLIT_IRQCHIP,
@@ -83,7 +83,7 @@ pub mod aarch64;
 // riscv64 dependencies
 #[cfg(target_arch = "riscv64")]
 pub mod riscv64;
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use crate::{RegList, StandardRegisters};
 pub use kvm_bindings;
 #[cfg(feature = "tdx")]
@@ -439,6 +439,24 @@ impl From<kvm_bindings::kvm_riscv_core> for crate::StandardRegisters {
 
 #[cfg(target_arch = "riscv64")]
 impl From<crate::StandardRegisters> for kvm_bindings::kvm_riscv_core {
+    fn from(state: crate::StandardRegisters) -> Self {
+        match state {
+            crate::StandardRegisters::Kvm(state) => state,
+            #[allow(unreachable_patterns)]
+            _ => panic!("StandardRegisters are not valid"),
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl From<kvm_bindings::kvm_regs> for crate::StandardRegisters {
+    fn from(state: kvm_bindings::kvm_regs) -> Self {
+        crate::StandardRegisters::Kvm(state)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl From<crate::StandardRegisters> for kvm_bindings::kvm_regs {
     fn from(state: crate::StandardRegisters) -> Self {
         match state {
             crate::StandardRegisters::Kvm(state) => state,
@@ -1349,7 +1367,7 @@ impl cpu::Vcpu for KvmVcpu {
     ///
     #[cfg(target_arch = "aarch64")]
     fn get_regs(&self) -> cpu::Result<StandardRegisters> {
-        let mut state: StandardRegisters = kvm_regs::default();
+        let mut state: kvm_regs = kvm_regs::default();
         let mut off = offset__of!(user_pt_regs, regs);
         // There are 31 user_pt_regs:
         // https://elixir.free-electrons.com/linux/v4.14.174/source/arch/arm64/include/uapi/asm/ptrace.h#L72
@@ -1464,7 +1482,7 @@ impl cpu::Vcpu for KvmVcpu {
             .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U32, off), &mut bytes)
             .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
         state.fp_regs.fpcr = u32::from_le_bytes(bytes);
-        Ok(state)
+        Ok(state.into())
     }
     #[cfg(target_arch = "x86_64")]
     ///
@@ -1488,6 +1506,7 @@ impl cpu::Vcpu for KvmVcpu {
     fn set_regs(&self, state: &StandardRegisters) -> cpu::Result<()> {
         // The function follows the exact identical order from `state`. Look there
         // for some additional info on registers.
+        let StandardRegisters::Kvm(state) = state;
         let mut off = offset__of!(user_pt_regs, regs);
         for i in 0..31 {
             self.fd
@@ -3041,13 +3060,13 @@ impl cpu::Vcpu for KvmVcpu {
             ..Default::default()
         };
         // Get core registers
-        state.core_regs = self.get_regs()?;
+        state.core_regs = self.get_regs()?.into();
 
         // Get systerm register
         // Call KVM_GET_REG_LIST to get all registers available to the guest.
         // For ArmV8 there are around 500 registers.
         let mut sys_regs: Vec<Register> = Vec::new();
-        let mut reg_list = RegList::new(500).unwrap();
+        let mut reg_list = kvm_bindings::RegList::new(500).unwrap();
         self.fd
             .lock()
             .unwrap()
@@ -3235,7 +3254,7 @@ impl cpu::Vcpu for KvmVcpu {
     fn set_state(&self, state: &CpuState) -> cpu::Result<()> {
         let state: VcpuKvmState = state.clone().into();
         // Set core registers
-        self.set_regs(&state.core_regs)?;
+        self.set_regs(&state.core_regs.into())?;
         // Set system registers
         for reg in &state.sys_regs {
             self.fd

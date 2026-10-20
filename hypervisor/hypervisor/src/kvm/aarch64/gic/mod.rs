@@ -36,11 +36,10 @@ pub fn gicv3_its_attr_get(its_device: &DeviceFd, group: u32, attr: u32) -> Resul
         addr: &mut val as *mut u64 as u64,
         flags: 0,
     };
-    its_device
-        .get_device_attr(&mut gicv3_its_attr)
-        .map_err(|e| {
-            Error::GetDeviceAttribute(HypervisorDeviceError::GetDeviceAttribute(e.into()))
-        })?;
+    // SAFETY: the buffer is a live local `mut` with the size the attr group expects.
+    unsafe { its_device.get_device_attr(&mut gicv3_its_attr) }.map_err(|e| {
+        Error::GetDeviceAttribute(HypervisorDeviceError::GetDeviceAttribute(e.into()))
+    })?;
     Ok(val)
 }
 

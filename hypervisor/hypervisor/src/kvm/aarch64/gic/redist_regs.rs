@@ -109,7 +109,8 @@ fn redist_attr_get(gic: &DeviceFd, offset: u32, typer: u64) -> Result<u32> {
         addr: &mut val as *mut u32 as u64,
         flags: 0,
     };
-    gic.get_device_attr(&mut gic_redist_attr).map_err(|e| {
+    // SAFETY: the buffer is a live local `mut` with the size the attr group expects.
+    unsafe { gic.get_device_attr(&mut gic_redist_attr) }.map_err(|e| {
         Error::GetDeviceAttribute(HypervisorDeviceError::GetDeviceAttribute(e.into()))
     })?;
     Ok(val)

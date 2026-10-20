@@ -90,7 +90,8 @@ fn dist_attr_get(gic: &DeviceFd, offset: u32) -> Result<u32> {
         addr: &mut val as *mut u32 as u64,
         flags: 0,
     };
-    gic.get_device_attr(&mut gic_dist_attr).map_err(|e| {
+    // SAFETY: the buffer is a live local `mut` with the size the attr group expects.
+    unsafe { gic.get_device_attr(&mut gic_dist_attr) }.map_err(|e| {
         Error::GetDeviceAttribute(HypervisorDeviceError::GetDeviceAttribute(e.into()))
     })?;
     Ok(val)
@@ -127,7 +128,8 @@ fn get_interrupts_num(gic: &DeviceFd) -> Result<u32> {
         addr: &mut num_irq as *mut u32 as u64,
         flags: 0,
     };
-    gic.get_device_attr(&mut nr_irqs_attr).map_err(|e| {
+    // SAFETY: the buffer is a live local `mut` with the size the attr group expects.
+    unsafe { gic.get_device_attr(&mut nr_irqs_attr) }.map_err(|e| {
         Error::GetDeviceAttribute(HypervisorDeviceError::GetDeviceAttribute(e.into()))
     })?;
     Ok(num_irq)
