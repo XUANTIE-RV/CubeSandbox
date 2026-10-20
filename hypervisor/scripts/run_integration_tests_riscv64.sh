@@ -4,16 +4,19 @@
 # --quick` (P1 test_direct_kernel_boot / P4 test_snapshot_restore_basic /
 # P5 test_api_snapshot_restore).
 #
-# REQUIRES a self-hosted riscv64 runner with KVM (H-extension): /dev/kvm must
-# exist, because Cube-Hypervisor(riscv64) is a KVM VMM. It cannot run on a
-# GitHub-hosted runner (no riscv64 KVM) -- hence the gated workflow
-# riscv64-snapshot-integration.yml. It also cannot be exercised under qemu TCG
-# (no /dev/kvm for the nested CH).
+# REQUIRES a riscv64 environment with KVM (H-extension): /dev/kvm must exist,
+# because Cube-Hypervisor(riscv64) is a KVM VMM. This is satisfied either by a
+# self-hosted riscv64+KVM runner, OR by the C1 backend (riscv64-snapshot-
+# integration.yml): a QEMU/TCG L1 whose emulated H-extension provides /dev/kvm,
+# so this script runs INSIDE that L1. It cannot run on a bare GitHub-hosted x86
+# runner (no riscv64 KVM) nor under plain TCG without the nested H-extension.
 #
-# Assets (7.2 Image, opensbi 1.7 fw_dynamic, Ubuntu riscv64 rootfs) come from
-# fetch_guest_assets_riscv64.sh (downloaded released assets) or a runner-prestaged
-# $WORKLOADS_DIR. The riscv64 component binaries (cube-runtime, containerd-shim-
-# cube-rs, cube-agent, cube-init) come from `make all-riscv64` (_output/bin).
+# Assets: the 7.2 guest Image is built IN-PLACE by build_guest_kernel_riscv64.sh
+# (kernel.org v7.2 source + the two CubeSandbox patches); opensbi 1.7 fw_dynamic
+# and the Ubuntu riscv64 rootfs are wget'd by fetch_guest_assets_riscv64.sh; or a
+# runner-prestaged $WORKLOADS_DIR supplies all three. The riscv64 component
+# binaries (cube-runtime, containerd-shim-cube-rs, cube-agent, cube-init) come
+# from `make all-riscv64` (_output/bin).
 #
 # The Cube-SPECIFIC sandbox assets are generated on demand if not prestaged:
 #   * cube-spec.json / cube-spec-restore.json / cube-min.tar
@@ -25,8 +28,7 @@
 # Override any of them via SPEC / SPEC_RESTORE / CUBE_MIN_TAR / GUEST_OS_IMAGE /
 # CUBE_AGENT_EXT4 to pin runner-prestaged paths instead.
 #
-# Flow mirrors the proven cube-l1 / cube-ali6000 testbed (see
-# yocto-integration/meta-cubesandbox/docs/validation-runbook.md): stage assets ->
+# Flow mirrors the proven cube-l1 / cube-ali6000 testbed: stage assets ->
 # standalone containerd-cube -> `ctr run --runtime io.containerd.cube.rs` (boots
 # L2 via the shim + Cube-Hypervisor) -> assert VsockServerReady + task RUNNING ->
 # create_snapshot -> restore -> verify fs marker + memory var survive (the same
@@ -36,8 +38,8 @@
 #   --quick  core smoke only: boot + vsock + one snapshot/restore (default).
 #
 # TODO(verify on runner): the exact toolbox layout and the snapshot CLI are
-# testbed-specific; the placeholders below match validation-runbook.md and must
-# be pinned to the runner's staged paths before first green run.
+# testbed-specific; the placeholders below must be pinned to the runner's staged
+# paths before first green run.
 
 set -euo pipefail
 
@@ -74,18 +76,26 @@ done
 command -v ctr >/dev/null 2>&1 || die "ctr (containerd CLI) not found on runner"
 
 info "precondition: guest assets (7.2 Image + fw_dynamic + rootfs)"
-if [[ ! -s "${WORKLOADS_DIR}/Image" || ! -s "${WORKLOADS_DIR}/fw_dynamic.bin" ]]; then
-  info "assets not staged -- fetching released assets"
-  CUBE_RISCV64_ASSET_BASE="${CUBE_RISCV64_ASSET_BASE:?set CUBE_RISCV64_ASSET_BASE (see fetch_guest_assets_riscv64.sh)}" \
-    WORKLOADS_DIR="${WORKLOADS_DIR}" \
+# In the C1 flow these are prestaged by the workflow and shared into the L1: the
+# 7.2 Image is built in-place by build_guest_kernel_riscv64.sh, fw_dynamic + rootfs
+# are wget'd by fetch_guest_assets_riscv64.sh. The fallbacks below only fire for a
+# manual / self-hosted run with an empty $WORKLOADS_DIR.
+if [[ ! -s "${WORKLOADS_DIR}/fw_dynamic.bin" ]]; then
+  info "fw_dynamic/rootfs not staged -- fetching from official public sources"
+  WORKLOADS_DIR="${WORKLOADS_DIR}" \
     bash "${REPO}/scripts/fetch_guest_assets_riscv64.sh"
+fi
+if [[ ! -s "${WORKLOADS_DIR}/Image" ]]; then
+  info "guest kernel Image not staged -- building in-place (v7.2 + CubeSandbox patches)"
+  WORKLOADS_DIR="${WORKLOADS_DIR}" \
+    bash "${REPO}/scripts/build_guest_kernel_riscv64.sh"
 fi
 KERNEL="${WORKLOADS_DIR}/Image"
 FW="${WORKLOADS_DIR}/fw_dynamic.bin"
-[[ -s "${KERNEL}" && -s "${FW}" ]] || die "guest kernel/fw_dynamic missing after fetch"
+[[ -s "${KERNEL}" && -s "${FW}" ]] || die "guest kernel/fw_dynamic missing after build/fetch"
 # CH riscv64 only loads a PE/EFI-stub Image (magic MZ). This is the SAME 7.2
-# CONFIG_KVM=y Image that booted L1 (see fetch_guest_assets_riscv64.sh): one
-# kernel for both L1 host and L2 guest, so the CI builds/publishes it once.
+# CONFIG_KVM=y Image that booted L1 (build_guest_kernel_riscv64.sh): one kernel for
+# both the L1 host and the L2 guest, built in-place from source + the two patches.
 [[ "$(head -c2 "${KERNEL}" | tr -d '\0')" == "MZ" ]] || die "${KERNEL} is not a PE Image (magic != MZ)"
 
 # --- 0b) generate the Cube-specific sandbox assets if not prestaged ----------

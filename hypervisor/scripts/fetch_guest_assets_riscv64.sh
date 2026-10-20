@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
-# fetch_guest_assets_riscv64.sh -- obtain the riscv64 guest assets (Linux 7.2
-# kernel Image, OpenSBI 1.7 fw_dynamic, Ubuntu riscv64 rootfs) using the SAME
-# mechanism the x86-64 integration tests use (see run_integration_tests_x86_64.sh):
-# plain `wget`/`curl` from official public sources, cached under $WORKLOADS_DIR
-# with `if [ ! -f ]` guards, then post-process (extract / unzip / qemu-img convert)
-# and verify.
+# fetch_guest_assets_riscv64.sh -- obtain the two riscv64 guest assets that HAVE
+# official public prebuilts (OpenSBI 1.7 fw_dynamic, Ubuntu riscv64 rootfs), using
+# the SAME mechanism the x86-64 integration tests use (see
+# run_integration_tests_x86_64.sh): plain `wget`/`curl` from official public
+# sources, cached under $WORKLOADS_DIR with `if [ ! -f ]` guards, then post-process
+# (extract / qemu-img convert) and verify.
+#
+# The Linux 7.2 guest kernel Image is NOT fetched here: kernel.org ships SOURCE
+# ONLY for riscv64 (no prebuilt Image), so it is built IN-PLACE by
+# build_guest_kernel_riscv64.sh (fetch v7.2 source -> apply the two CubeSandbox
+# patches -> cross-compile). Call that script to produce ${WORKLOADS_DIR}/Image.
 #
 # This script does NOT build anything and does NOT need KVM -- it only proves the
-# riscv64 assets are fetchable, intact, and assembleable. Booting them and running
-# snapshot/restore is run_integration_tests_riscv64.sh's job (needs a self-hosted
-# riscv64+KVM runner).
+# fetchable assets are intact and assembleable. Booting them and running
+# snapshot/restore is run_c1_nested_riscv64.sh's job.
 #
 # VERIFIED public sources (all HTTP 200 as of authoring):
 #   * OpenSBI 1.7 fw_dynamic (PREBUILT, official release asset):
@@ -17,24 +21,7 @@
 #       -> extract opensbi-1.7-rv-bin/share/opensbi/lp64/generic/firmware/fw_dynamic.bin
 #   * Ubuntu 24.04 (noble) riscv64 server cloud image (official Canonical):
 #       https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-riscv64.img
-#   * Linux 7.2 kernel: kernel.org publishes SOURCE ONLY (no prebuilt riscv64 Image):
-#       https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.tar.xz   (tag v7.2, released)
-#     So the guest 7.2 Image must be BUILT with CONFIG_KVM=y (make guest-kernel
-#     KERNEL_SRC=<v7.2 tree> KERNEL_TARGET_ARCH=riscv64, config
-#     configs/kernel-oc9.riscv64.config with a KVM=m->y override) and published to a
-#     Release, then downloaded here via CUBE_RISCV64_ASSET_BASE.
-#     ONE KVM=y 7.2 Image serves BOTH layers of the C1 nested test (saves a build):
-#       - L1 host kernel (qemu -kernel): KVM=y gives /dev/kvm for cloud-hypervisor
-#         (verified under upstream qemu 11 TCG: "kvm: hypervisor extension available",
-#          "AIA available with 4 guest external interrupts", /dev/kvm present);
-#       - L2 guest kernel (cube-kernel-scf/vmlinux): KVM=y unused but harmless (+12KB).
-#     Cube-Hypervisor riscv64 load_kernel only accepts a PE/EFI-stub Image (magic
-#     "MZ"), NOT an ELF vmlinux.
 #
-# REQUIRED env (only for the kernel -- the one asset with no official prebuilt):
-#   CUBE_RISCV64_ASSET_BASE   base URL of the Release dir holding `vmlinux-riscv64`
-#                             (the built 7.2 PE Image). e.g.
-#                             https://github.com/<org>/CubeSandbox/releases/download/riscv64-guest
 # Optional env (verified public defaults; override to pin a mirror/version):
 #   OPENSBI_URL               default: the v1.7 release tarball above
 #   CUBE_RISCV64_ROOTFS_URL   default: the noble riscv64 cloudimg above
@@ -96,21 +83,7 @@ if [[ ! -f "${ROOTFS_RAW}" ]]; then
   qemu-img convert -p -f "${fmt}" -O raw "${ROOTFS_DL}" "${ROOTFS_RAW}" || die "qemu-img convert failed"
 fi
 
-# 3) guest kernel: released Linux 7.2 PE Image (published asset -- no official prebuilt)
-KERNEL_DEST="${WORKLOADS_DIR}/Image"
-if [[ ! -s "${KERNEL_DEST}" ]]; then
-  if [[ -z "${CUBE_RISCV64_ASSET_BASE:-}" ]]; then
-    die "CUBE_RISCV64_ASSET_BASE is not set and no cached ${KERNEL_DEST}.
-  Linux 7.2 has NO official prebuilt riscv64 Image (kernel.org ships source only:
-    https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.tar.xz).
-  Build it (make guest-kernel KERNEL_SRC=<v7.2 tree> KERNEL_TARGET_ARCH=riscv64,
-  config configs/kernel-oc9.riscv64.config), publish it to a Release, then set
-  CUBE_RISCV64_ASSET_BASE to that Release dir (expected file: vmlinux-riscv64)."
-  fi
-  fetch "${CUBE_RISCV64_ASSET_BASE%/}/vmlinux-riscv64" "${KERNEL_DEST}"
-fi
-
-# 4) integrity: sha1sums-riscv64 (skip if it has no sum lines yet)
+# 3) integrity: sha1sums-riscv64 (skip if it has no sum lines yet)
 if [[ -s "${SHA1SUMS}" ]] && grep -qE '^[0-9a-f]{40}' "${SHA1SUMS}"; then
   echo "verifying sha1sums-riscv64"
   ( cd "${WORKLOADS_DIR}" && sha1sum -c --ignore-missing "${SHA1SUMS}" ) || die "sha1 verification failed"
@@ -118,17 +91,14 @@ else
   echo "note: ${SHA1SUMS} has no checksums yet -- skipping integrity check"
 fi
 
-# 5) assertions
+# 4) assertions (the kernel Image is built separately by build_guest_kernel_riscv64.sh)
 echo "=== assertions ==="
 [[ -s "${FW_DEST}" ]] || die "fw_dynamic.bin missing/empty"
 echo "  fw_dynamic.bin (opensbi 1.7): OK ($(stat -c%s "${FW_DEST}") bytes)"
 [[ -s "${ROOTFS_RAW}" ]] || die "rootfs raw missing/empty"
 qemu-img info "${ROOTFS_RAW}" >/dev/null 2>&1 || die "rootfs ${ROOTFS_RAW} not recognized by qemu-img"
 echo "  rootfs (ubuntu noble riscv64): OK ($(stat -c%s "${ROOTFS_RAW}") bytes)"
-[[ -s "${KERNEL_DEST}" ]] || die "kernel Image missing/empty"
-magic="$(head -c2 "${KERNEL_DEST}" | tr -d '\0')"
-[[ "${magic}" == "MZ" ]] || die "kernel ${KERNEL_DEST} is not a PE/EFI-stub Image (magic='${magic}', expected 'MZ'); CH riscv64 load_kernel would reject it (InvalidImageMagicNumber)"
-echo "  kernel Image (linux 7.2): PE magic MZ OK ($(stat -c%s "${KERNEL_DEST}") bytes)"
 
 echo "ASSET_DIR=${WORKLOADS_DIR}"
-echo "riscv64 guest assets fetched + assembled OK (opensbi 1.7 fw_dynamic + Ubuntu noble rootfs + 7.2 Image)."
+echo "riscv64 fetchable assets OK (opensbi 1.7 fw_dynamic + Ubuntu noble rootfs)."
+echo "note: build the 7.2 guest kernel Image with build_guest_kernel_riscv64.sh (-> ${WORKLOADS_DIR}/Image)."
