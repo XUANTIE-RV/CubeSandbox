@@ -106,7 +106,9 @@ runcmd:
   - [ mkdir, -p, /data ]
   - [ mount, /dev/vdb, /data ]
   - [ mkdir, -p, /usr/local/services/cubetoolbox/cube-image, /usr/local/services/cubetoolbox/cube-agent, /usr/local/services/cubetoolbox/cube-kernel-scf, /tmp/snapshot-share-dir ]
-final_message: "c1 L1 cloud-init done after $UPTIME seconds"
+# NB: \$UPTIME must stay literal -- it is a cloud-init template variable rendered
+# by the L1, and this heredoc is unquoted while the script runs under set -u.
+final_message: "c1 L1 cloud-init done after \$UPTIME seconds"
 EOF
 if command -v cloud-localds >/dev/null 2>&1; then
   cloud-localds "${RUNDIR}/cidata.img" "${SEED_DIR}/user-data" "${SEED_DIR}/meta-data"
