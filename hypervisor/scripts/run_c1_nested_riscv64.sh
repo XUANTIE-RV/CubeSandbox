@@ -169,7 +169,9 @@ ${SSH} 'sudo bash -c "
   # stage the assets where run_integration_tests_riscv64.sh expects them
   cp -f /mnt/share/Image /mnt/share/vmlinux /mnt/share/cube-*.img /mnt/share/cube-*.ext4 /mnt/share/cube-*.json /mnt/share/cube-min.tar /mnt/share/*-riscv64 /data/ 2>/dev/null || true
   chmod +x /mnt/share/run_integration_tests_riscv64.sh
-  WORKLOADS_DIR=/data bash /mnt/share/run_integration_tests_riscv64.sh --quick
+  # The integration script resolves REPO from its own path (/mnt/share), so its
+  # default OUTPUT_BIN=/mnt/_output/bin never exists; the binaries live in /data.
+  WORKLOADS_DIR=/data OUTPUT_BIN=/data bash /mnt/share/run_integration_tests_riscv64.sh --quick
 "' 2>&1 | tee "${RUNDIR}/integration.log"
 rc=${PIPESTATUS[0]}
 
