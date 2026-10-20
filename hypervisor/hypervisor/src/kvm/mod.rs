@@ -2466,11 +2466,13 @@ impl cpu::Vcpu for KvmVcpu {
         // the mmap'd kvm_run page. Take a raw pointer to it before run(): the
         // VcpuExit that run() returns borrows the fd for the whole match, so an
         // arm cannot otherwise reach the page through the fd.
-        // NB: `as *mut _` instead of `&raw mut` -- the pinned hypervisor
-        // toolchain (1.77.2) predates raw-ref syntax (stabilized in 1.82), and
-        // cfg-gated code is still parsed on every arch.
+        // NB: explicit `as *mut kvm_run` instead of `&raw mut` -- the pinned
+        // hypervisor toolchain (1.77.2) predates raw-ref syntax (stabilized in
+        // 1.82), and cfg-gated code is still parsed on every arch. The pointee
+        // type must be named: `as *mut _` does not inherit it from the
+        // reference and fails to infer (E0282).
         #[cfg(target_arch = "riscv64")]
-        let krun = vcpu_fd.get_kvm_run() as *mut _;
+        let krun = vcpu_fd.get_kvm_run() as *mut kvm_run;
 
         match vcpu_fd.run() {
             Ok(run) => match run {
