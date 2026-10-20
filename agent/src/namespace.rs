@@ -16,7 +16,10 @@ use tracing::instrument;
 use crate::mount::{baremount, FLAGS};
 use slog::Logger;
 
-const PERSISTENT_NS_DIR: &str = "/var/run/sandbox-ns";
+// Keep this under /run: the agent init mounts a tmpfs there, while /var/run
+// only works when the guest image ships the /var/run -> /run symlink (minimal
+// images with a read-only DAX rootfs do not).
+const PERSISTENT_NS_DIR: &str = "/run/sandbox-ns";
 pub const NSTYPEIPC: &str = "ipc";
 pub const NSTYPEUTS: &str = "uts";
 pub const NSTYPEPID: &str = "pid";
