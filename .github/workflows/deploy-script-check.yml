@@ -76,12 +76,37 @@ jobs:
             if ! bash -n "${f}"; then
               echo "::error file=${f}::bash syntax error"; fail=1
             fi
-            echo "=== shellcheck ${f} ==="
-            # -S warning: only warning/error severity, so pre-existing style
-            # nitpicks in untouched lines do not fail the gate.
-            if ! shellcheck -S warning "${f}"; then
-              echo "::error file=${f}::shellcheck found warning+ issues"; fail=1
+            echo "=== shellcheck ${f} (gating only lines this PR changed) ==="
+            # NB: shellcheck lints the WHOLE file, so a PR that merely touches
+            # one line of a large script would otherwise fail on that file's
+            # PRE-EXISTING warnings. Scope the gate to the line numbers this PR
+            # added/changed (derived from the same range used to select files).
+            # -S warning keeps only warning/error severity. On a first push (no
+            # range) there is no diff to scope to, so lint the whole file.
+            declare -A changed=()
+            if [[ -n "${range}" ]]; then
+              while IFS= read -r ln; do
+                [[ -n "${ln}" ]] && changed["${ln}"]=1
+              done < <(git diff -U0 "${range}" -- "${f}" | awk '
+                /^@@/ { if (match($0, /\+[0-9]+(,[0-9]+)?/)) {
+                          s=substr($0, RSTART+1, RLENGTH-1); split(s, a, ",");
+                          st=a[1]+0; n=(a[2]==""?1:a[2]+0);
+                          for (i=0;i<n;i++) print st+i } }')
             fi
+            gated=0
+            while IFS= read -r finding; do
+              [[ -n "${finding}" ]] || continue
+              rest="${finding#*:}"; ln="${rest%%:*}"
+              if [[ -z "${range}" || -n "${changed[${ln}]:-}" ]]; then
+                echo "${finding}"; gated=1
+              fi
+            done < <(shellcheck -S warning -f gcc "${f}" 2>/dev/null)
+            if [[ "${gated}" -ne 0 ]]; then
+              echo "::error file=${f}::shellcheck warning+ on lines changed by this PR"; fail=1
+            else
+              echo "  no shellcheck warning+ on PR-changed lines (pre-existing warnings not gated)"
+            fi
+            unset changed
           done
 
           if [[ "${fail}" -ne 0 ]]; then
