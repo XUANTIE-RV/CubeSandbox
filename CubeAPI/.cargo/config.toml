@@ -1,0 +1,6 @@
+# Force the riscv64 musl target to link the C runtime statically so cube-api has
+# no PT_INTERP and runs on any riscv64 target (glibc or musl) without shipping the
+# cross-toolchain's musl loader. Applies only to the cross target; host build
+# scripts/proc-macros are unaffected.
+[target.riscv64gc-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]
