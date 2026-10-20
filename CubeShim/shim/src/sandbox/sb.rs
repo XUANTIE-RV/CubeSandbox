@@ -1912,14 +1912,16 @@ mod tests {
             .cmdlines
             .contains(&"another.param=foo".to_string()));
 
-        let mut set_expect: HashSet<String> = vec![
-            "highres=off",
-            "clocksource=kvm-clock",
-            "agent.unified_cgroup_hierarchy=true",
-        ]
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect();
+        let mut set_expect: HashSet<String> = vec!["agent.unified_cgroup_hierarchy=true"]
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        // highres/clocksource=kvm-clock are only added on x86_64 (see prepare_resource).
+        #[cfg(target_arch = "x86_64")]
+        {
+            set_expect.insert("highres=off".to_string());
+            set_expect.insert("clocksource=kvm-clock".to_string());
+        }
         let set_unexpect: HashSet<String> = vec!["clocksource=tsc", "tsc=reliable"]
             .into_iter()
             .map(|s| s.to_string())
