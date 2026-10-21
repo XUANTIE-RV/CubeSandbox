@@ -129,32 +129,29 @@ redis-server --version
 # mysql_native_password users (the CubeSandbox DSN is plain TCP, no TLS).
 # On 8.0 the plugin is always available -- no server flag needed (the 8.4-only
 # mysql_native_password=ON knob from the bed my.cnf is intentionally absent).
-info "configure + start mysqld"
-systemctl stop mysql 2>/dev/null || true
-# The apt postinst auto-starts a systemd mysqld holding the datadir lock; make
-# sure it is really gone before starting ours (stop is async under TCG).
-for i in $(seq 1 30); do pgrep -x mysqld >/dev/null || break; sleep 2; done
-if pgrep -x mysqld >/dev/null; then die "systemd mysqld would not stop"; fi
-mkdir -p /var/run/mysqld /data/log
+#
+# Use the apt package's systemd unit instead of hand-rolling mysqld: Ubuntu
+# noble pins user=mysql in /etc/mysql/mysql.conf.d/mysqld.cnf (mysqld honors
+# only the FIRST user option, so --user=root is silently ignored) and the mysql
+# user cannot write a root-owned /var/run/mysqld or /var/log path -- manual
+# startup aborted with "Could not open file ... Permission denied" (runs
+# 39598987778/39607243216). The unit gets user/paths/AppArmor right; the
+# postinst already initialized the datadir and defaults (bind 127.0.0.1:3306,
+# 128M buffer pool) are fine for this demo.
+info "start mysqld (systemd unit from the apt package)"
 if [[ ! -d /var/lib/mysql/mysql ]]; then
   info "initializing MySQL datadir (insecure bootstrap)"
-  mysqld --initialize-insecure --user=root --datadir=/var/lib/mysql
+  mysqld --initialize-insecure --user=mysql --datadir=/var/lib/mysql
 fi
-# --log-error: Ubuntu's /etc/mysql/mysql.conf.d/mysqld.cnf silently redirects
-# the error log to /var/log/mysql/error.log; without this flag the nohup
-# redirect stays empty and failures are invisible (run 39598987778).
-nohup mysqld --user=root --datadir=/var/lib/mysql \
-  --socket=/var/run/mysqld/mysqld.sock --bind-address=127.0.0.1 --port=3306 \
-  --skip-name-resolve --mysqlx=OFF --log-error=/var/log/cube-mysqld.log \
-  --innodb_buffer_pool_size=128M --innodb_redo_log_capacity=64M \
-  --max_connections=64 \
-  >/var/log/cube-mysqld.out 2>&1 &
+systemctl start mysql
 i=0
 until mysqladmin ping --socket=/var/run/mysqld/mysqld.sock --silent 2>/dev/null; do
-  i=$((i+1)); [[ ${i} -ge 300 ]] && die "mysqld not ready (see /var/log/cube-mysqld.log)"
+  i=$((i+1)); [[ ${i} -ge 300 ]] && die "mysqld not ready (see /var/log/mysql/error.log)"
   sleep 2
 done
 info "mysqld ready after ~$((i*2))s"
+# root@localhost authenticates via auth_socket on Ubuntu; this client runs as
+# root, so the socket path below needs no password.
 mysql --socket=/var/run/mysqld/mysqld.sock -uroot <<'SQL'
 CREATE DATABASE IF NOT EXISTS cube_mvp CHARACTER SET utf8mb4;
 ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'cube_root';
