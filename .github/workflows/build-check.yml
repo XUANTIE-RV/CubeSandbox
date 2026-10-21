@@ -416,7 +416,11 @@ jobs:
 
       - name: Execute each riscv64 binary under qemu-user
         run: |
-          set -uo pipefail
+          # GitHub runs this under bash -e, but the probes below are EXPECTED to
+          # exit non-zero (usage errors, cube-init's not-PID-1 panic=101, timeout
+          # 124) and are classified via rc=$? -- errexit would kill the step at
+          # the first non-zero probe with no FAIL diagnostics. Disable it.
+          set +e -uo pipefail
           cd riscv64-bin
           chmod +x ./*-riscv64 2>/dev/null || true
           fail=0
