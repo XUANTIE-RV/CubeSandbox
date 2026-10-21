@@ -225,3 +225,62 @@ jobs:
             ${{ runner.temp }}/c1-l1/qemu-guest-errors.log
           if-no-files-found: ignore
           retention-days: 7
+
+  # Examples sanity gate: every examples/**/*.py must byte-compile, the no-LLM
+  # demo's deps must install from PyPI, and its CLI contract (usage / missing-env
+  # preflight) must hold. Catches example bit-rot at PR time WITHOUT a cluster.
+  examples-sanity:
+    name: Examples sanity (no LLM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Byte-compile all examples (full file list, full output)
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF'
+          import py_compile, pathlib, sys
+          files = sorted(pathlib.Path("examples").rglob("*.py"))
+          print(f"py_compile targets ({len(files)} files):")
+          bad = 0
+          for f in files:
+              try:
+                  py_compile.compile(str(f), doraise=True)
+                  print(f"  OK   {f}")
+              except py_compile.PyCompileError as e:
+                  bad += 1
+                  print(f"  FAIL {f}: {e}")
+          if bad:
+              print(f"RESULT: {bad}/{len(files)} files failed to compile")
+              sys.exit(1)
+          print(f"RESULT: {len(files)} files checked, ALL OK")
+          EOF
+
+      - name: Install demo deps (cubesandbox SDK + python-dotenv)
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/demo-venv
+          /tmp/demo-venv/bin/pip install "cubesandbox>=0.2.0" python-dotenv
+
+      - name: Smoke coldstart_snapshot_demo.py CLI contract
+        run: |
+          set -uo pipefail  # NOT -e: the no-env run MUST exit non-zero; assert explicitly
+          DEMO=examples/openai-agents-code-interpreter/coldstart_snapshot_demo.py
+          echo "=== smoke 1: no environment -> preflight must fail with a clear reason ==="
+          set +e
+          out=$(/tmp/demo-venv/bin/python "${DEMO}" 2>&1)
+          rc=$?
+          set -e
+          echo "${out}"
+          echo "exit code: ${rc}"
+          if [[ ${rc} -ne 2 ]] || ! grep -q "PREFLIGHT FAIL: CUBE_TEMPLATE_ID is unset" <<<"${out}"; then
+            echo "FAIL: expected rc=2 with the CUBE_TEMPLATE_ID preflight message"
+            exit 1
+          fi
+          echo "smoke 1: PASS (preflight fails fast with the expected message)"
+          echo "=== smoke 2: --help -> usage, rc=0 ==="
+          /tmp/demo-venv/bin/python "${DEMO}" --help
+          echo "smoke 2: PASS"
+          echo "EXAMPLES-SANITY: PASS"
