@@ -49,8 +49,9 @@ fetch() { # fetch <url> <dest>
   local url="$1" dest="$2"
   if [[ -f "${dest}" && -s "${dest}" ]]; then echo "cached: ${dest}"; return; fi
   echo "download: ${url}"
-  if have wget; then ( cd "${WORKLOADS_DIR}" && wget --quiet "${url}" -O "$(basename "${dest}")" );
-  elif have curl; then curl -fsSL "${url}" -o "${dest}";
+  # No --quiet/-s: download errors (and progress) must reach the CI job log.
+  if have wget; then ( cd "${WORKLOADS_DIR}" && wget "${url}" -O "$(basename "${dest}")" );
+  elif have curl; then curl -fSL "${url}" -o "${dest}";
   else die "neither wget nor curl available"; fi
   [[ -s "${dest}" ]] || die "downloaded file is empty: ${dest} (url=${url})"
 }

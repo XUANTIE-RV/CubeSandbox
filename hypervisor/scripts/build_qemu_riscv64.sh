@@ -55,11 +55,13 @@ fi
 #    1.3.2, so meson comes from a pip venv below (proven in the local build).
 if [[ "${SKIP_APT_DEPS:-0}" != "1" ]]; then
   SUDO=""; [[ "$(id -u)" -ne 0 ]] && SUDO="sudo"
-  ${SUDO} apt-get update -qq
-  ${SUDO} apt-get install -y -qq --no-install-recommends \
+  # Full apt/pip/build output flows to the CI log on purpose: on a runner the
+  # job log is the ONLY debug surface, so nothing here may be silenced.
+  ${SUDO} apt-get update
+  ${SUDO} apt-get install -y --no-install-recommends \
     build-essential ninja-build pkg-config python3 python3-venv python3-pip \
     libglib2.0-dev libpixman-1-dev libslirp-dev zlib1g-dev libfdt-dev \
-    xz-utils curl ca-certificates >/dev/null
+    xz-utils curl ca-certificates
 fi
 for t in ninja pkg-config python3 curl tar xz; do
   command -v "$t" >/dev/null 2>&1 || die "missing build tool: $t (unset SKIP_APT_DEPS or install it)"
@@ -72,7 +74,7 @@ if [[ ! -x "${VENV}/bin/meson" ]]; then
   python3 -m venv "${VENV}"
   # meson>=1.5 for qemu 11; tomli is needed by qemu's mkvenv on python<3.11
   # (3.11+ has stdlib tomllib); pycotap/qemu.qmp are mkvenv test deps.
-  "${VENV}/bin/pip" install --quiet "meson==1.8.1" tomli pycotap "qemu.qmp==0.0.6" setuptools wheel
+  "${VENV}/bin/pip" install "meson==1.8.1" tomli pycotap "qemu.qmp==0.0.6" setuptools wheel
 fi
 export PATH="${VENV}/bin:${PATH}"
 
@@ -86,15 +88,16 @@ fi
 [[ -d "${SRC}" ]] || { echo "[qemu] extract -> ${SRC}"; tar -xf "${TARBALL}" -C "${QEMU_SRC_DIR}"; }
 
 # 4) configure + build riscv64-softmmu only (slirp = user networking for the
-#    C1 hostfwd; everything graphical off)
+#    C1 hostfwd; everything graphical off). configure/make output is NOT
+#    redirected: a qemu build failure must be diagnosable from the job log.
 echo "[qemu] configure + build (riscv64-softmmu, jobs=${QEMU_BUILD_JOBS})"
 mkdir -p "${SRC}/build"
 cd "${SRC}/build"
 ../configure --target-list=riscv64-softmmu --enable-slirp --disable-docs \
   --disable-gtk --disable-sdl --disable-opengl --disable-virglrenderer \
-  --prefix="${QEMU_PREFIX}" >/dev/null
-make -j"${QEMU_BUILD_JOBS}" >/dev/null
-make install >/dev/null
+  --prefix="${QEMU_PREFIX}"
+make -j"${QEMU_BUILD_JOBS}"
+make install
 
 # 5) verify
 [[ -x "${QEMU_BIN}" ]] || die "build did not produce ${QEMU_BIN}"
