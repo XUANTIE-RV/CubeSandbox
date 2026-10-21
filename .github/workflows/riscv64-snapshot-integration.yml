@@ -116,6 +116,13 @@ jobs:
           hypervisor/scripts/build_qemu_riscv64.sh
 
       - name: Build riscv64 components
+        env:
+          # Optional mirror for the riscv64 musl cross toolchain tarball
+          # (docker/Dockerfile.builder ARG RISCV64_MUSL_CROSS_URL). musl.cc is
+          # intermittently unreachable from GitHub-hosted runners; a fork can
+          # set the CUBE_RISCV64_MUSL_CROSS_URL repo variable to a mirror (the
+          # Dockerfile sha256 pin still applies). Empty -> Dockerfile default.
+          RISCV64_MUSL_CROSS_URL: ${{ vars.CUBE_RISCV64_MUSL_CROSS_URL }}
         run: |
           set -euo pipefail
           # Produces _output/bin/*-riscv64 (cube-runtime, containerd-shim-cube-rs,
