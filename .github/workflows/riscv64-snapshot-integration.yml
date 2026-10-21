@@ -99,7 +99,7 @@ jobs:
             openssh-client btrfs-progs \
             gcc-riscv64-linux-gnu build-essential bc bison flex libelf-dev \
             libssl-dev libncurses-dev dwarves cpio kmod rsync xz-utils patch
-          riscv64-linux-gnu-gcc --version | head -1
+          riscv64-linux-gnu-gcc --version
 
       - name: Cache community QEMU ${{ env.QEMU_VERSION }} build
         uses: actions/cache@v4

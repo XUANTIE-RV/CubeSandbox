@@ -81,7 +81,8 @@ dump_all_logs() {
 FAILED=1
 on_exit() {
   echo "=== [cp] final state: $([[ ${FAILED} -eq 0 ]] && echo PASS || echo FAIL) ==="
-  ss -ltn 2>/dev/null | grep -E ':3000|:3010|:3306|:6379|:8089|:8090|:9999|:9998|:1338' || true
+  echo "=== listening sockets (full, unfiltered) ==="
+  ss -ltnp 2>/dev/null || true
   dump_net_state "at exit" 2>/dev/null || true
   dump_all_logs
 }
