@@ -70,6 +70,9 @@ magic=$(head -c2 "${WORKLOADS_DIR}/Image" 2>/dev/null || true)
 [[ "${magic}" == "MZ" ]] || die "Image is not a PE/EFI-stub (magic='${magic}'); CH would reject it"
 
 # --- L1 rootfs: copy-on-write overlay over the fetched cloud image -----------
+# RUNDIR may not exist yet (CI passes ${runner.temp}/c1-l1, and nothing else
+# creates it; the local replay driver happened to mkdir it for us).
+mkdir -p "${RUNDIR}"
 info "preparing L1 disks in ${RUNDIR}"
 ROOTFS_SRC="${ROOTFS:-}"
 if [[ -z "${ROOTFS_SRC}" ]]; then
