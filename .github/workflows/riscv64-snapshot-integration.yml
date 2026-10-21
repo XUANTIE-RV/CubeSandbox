@@ -128,7 +128,13 @@ jobs:
           # Produces _output/bin/*-riscv64 (cube-runtime, containerd-shim-cube-rs,
           # cube-agent, cube-init, ...). SKIP_BUILDER_IMAGE_CHECK lets a runner
           # with a prebuilt builder image reuse it.
-          make all-riscv64 SKIP_BUILDER_IMAGE_CHECK=1 || make all-riscv64
+          # First attempt may fail fast on the missing builder image (the SKIP
+          # probe); the fallback builds it. One more retry on top for transient
+          # network flakes inside the builder container (observed: goproxy.cn
+          # GOAWAY during Cubelet 'go mod download', run 39596327273); the
+          # host-mounted GOPATH cache makes a retry re-download little.
+          make all-riscv64 SKIP_BUILDER_IMAGE_CHECK=1 || make all-riscv64 \
+            || make all-riscv64 SKIP_BUILDER_IMAGE_CHECK=1
           # l2pause: the L2 container entrypoint baked into the guest image below
           # (cube-spec args /usr/bin/l2pause; the cube-min.tar layer is empty).
           make l2pause-riscv64 SKIP_BUILDER_IMAGE_CHECK=1 || make l2pause-riscv64
