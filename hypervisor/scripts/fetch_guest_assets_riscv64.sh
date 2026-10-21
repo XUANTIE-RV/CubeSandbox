@@ -69,14 +69,17 @@ fi
 [[ -s "${FW_DEST}" ]] || die "fw_dynamic.bin not obtained from OpenSBI 1.7 tarball"
 
 # 2) rootfs: Ubuntu riscv64 cloud image -> raw (mirror x86 qemu-img convert step)
-ROOTFS_DL="${WORKLOADS_DIR}/$(basename "${ROOTFS_URL}")"
-fetch "${ROOTFS_URL}" "${ROOTFS_DL}"
-case "${ROOTFS_DL}" in
-  *.zip) ( cd "${WORKLOADS_DIR}" && unzip -o "${ROOTFS_DL}" )
-         ROOTFS_DL="$(ls -1t "${WORKLOADS_DIR}"/*.qcow2 "${WORKLOADS_DIR}"/*.img 2>/dev/null | head -1)" ;;
-esac
+# The ~800MB qcow2 download sits INSIDE the guard: when ubuntu-riscv64.raw is
+# already present (warm actions/cache) there is nothing to convert, so skip the
+# download too -- re-fetching it every run defeats the cache.
 ROOTFS_RAW="${WORKLOADS_DIR}/ubuntu-riscv64.raw"
 if [[ ! -f "${ROOTFS_RAW}" ]]; then
+  ROOTFS_DL="${WORKLOADS_DIR}/$(basename "${ROOTFS_URL}")"
+  fetch "${ROOTFS_URL}" "${ROOTFS_DL}"
+  case "${ROOTFS_DL}" in
+    *.zip) ( cd "${WORKLOADS_DIR}" && unzip -o "${ROOTFS_DL}" )
+           ROOTFS_DL="$(ls -1t "${WORKLOADS_DIR}"/*.qcow2 "${WORKLOADS_DIR}"/*.img 2>/dev/null | head -1)" ;;
+  esac
   have qemu-img || die "qemu-img not found (install qemu-utils)"
   fmt="raw"; case "${ROOTFS_DL}" in *.qcow2|*.img) fmt="qcow2";; esac
   echo "qemu-img convert -f ${fmt} -O raw ${ROOTFS_DL} -> ${ROOTFS_RAW}"

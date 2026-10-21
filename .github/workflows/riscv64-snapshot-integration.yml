@@ -18,12 +18,18 @@ name: RISC-V Snapshot Integration
 #   kernel : kernel.org v7.2 + configs/patches/{riscv64-dax-zeropage-folio,
 #            riscv64-kvm-zeropage-dirtylog}, built IN-PLACE by
 #            build_guest_kernel_riscv64.sh (same two patches as yocto
-#            linux-xuantie_7.2.bb). Building from source+patches every run
-#            GUARANTEES the KVM dirty-log backport is present: without it the
-#            KVM dirty-log fast path lets the L2 write through a read-only
-#            ZERO_PAGE G-stage leaf into the L1's empty_zero_page at -smp>1,
-#            corrupting every fresh anon page in the L1 (Go "arena already
-#            initialized" / awk segfault). RISCV64_L1_SMP defaults to 4.
+#            linux-xuantie_7.2.bb). The build output (${WORKLOADS_DIR}/Image) is
+#            actions/cache'd with a key that hashes the kernel config, BOTH
+#            patches, and both build scripts -- any change to those inputs
+#            forces a from-source rebuild, which keeps the hard requirement
+#            enforceable by cache-key rather than by recompiling every run:
+#            without the KVM dirty-log backport the KVM dirty-log fast path
+#            lets the L2 write through a read-only ZERO_PAGE G-stage leaf into
+#            the L1's empty_zero_page at -smp>1, corrupting every fresh anon
+#            page in the L1 (Go "arena already initialized" / awk segfault).
+#            Deliberately NO restore-keys: a prefix-matched stale Image built
+#            from different patches is exactly what must never boot.
+#            RISCV64_L1_SMP defaults to 4.
 #   qemu   : community 11.x, built from the qemu.org source release by
 #            build_qemu_riscv64.sh (actions/cache'd). The distro qemu is NOT
 #            usable: ubuntu-24.04's apt qemu 8.2.2 has broken TCG IMSIC/AIA --
@@ -32,6 +38,11 @@ name: RISC-V Snapshot Integration
 #            and the shim panics at check_required_extensions.
 #   opensbi: community v1.7 release fw_dynamic.bin, wget'd by
 #            fetch_guest_assets_riscv64.sh (together with the Ubuntu rootfs).
+#            Both outputs are actions/cache'd; the rootfs key embeds the
+#            (overridable) CUBE_RISCV64_ROOTFS_URL so pinning a different
+#            image busts the cache. The default noble 'current' URL is a
+#            moving target, so a warm cache intentionally pins whatever noble
+#            build was fetched on the cold run until the key version is bumped.
 # No 件 0 Release asset and no CUBE_RISCV64_ASSET_BASE variable are required.
 
 on:
@@ -115,7 +126,18 @@ jobs:
           # (cube-spec args /usr/bin/l2pause; the cube-min.tar layer is empty).
           make l2pause-riscv64 SKIP_BUILDER_IMAGE_CHECK=1 || make l2pause-riscv64
 
+      - name: Cache 7.2 guest kernel Image
+        id: cache-kernel
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WORKLOADS_DIR }}/Image
+          # The key hashes every input that can change the Image: config, both
+          # out-of-tree patches, and both build scripts. No restore-keys -- a
+          # prefix-matched stale kernel would silently drop a patch change.
+          key: kernel-7.2-riscv64-v1-${{ hashFiles('configs/kernel-oc9.riscv64.config', 'configs/patches/riscv64-dax-zeropage-folio.patch', 'configs/patches/riscv64-kvm-zeropage-dirtylog.patch', 'scripts/build-kernel.sh', 'hypervisor/scripts/build_guest_kernel_riscv64.sh') }}
+
       - name: Build 7.2 guest kernel Image (in-place, cross-compiled)
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           chmod +x hypervisor/scripts/build_guest_kernel_riscv64.sh
@@ -123,6 +145,17 @@ jobs:
           # Serves BOTH the C1 L1 host kernel (qemu -kernel, needs /dev/kvm) and the
           # L2 guest kernel. WORKLOADS_DIR is inherited from the workflow env.
           hypervisor/scripts/build_guest_kernel_riscv64.sh
+
+      - name: Cache riscv64 guest assets (opensbi fw + Ubuntu rootfs raw)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.WORKLOADS_DIR }}/fw_dynamic.bin
+            ${{ env.WORKLOADS_DIR }}/ubuntu-riscv64.raw
+          # fetch_guest_assets_riscv64.sh skips download+convert when both files
+          # exist, so a hit makes the fetch step a no-op. The key embeds the
+          # rootfs URL var: overriding CUBE_RISCV64_ROOTFS_URL busts the cache.
+          key: guest-assets-riscv64-v1-${{ vars.CUBE_RISCV64_ROOTFS_URL || 'noble-current' }}
 
       - name: Fetch riscv64 guest assets (opensbi + rootfs)
         env:
