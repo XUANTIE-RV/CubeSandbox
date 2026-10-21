@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Install MySQL 8.4 + Redis natively on a riscv64 host from prebuilt Yocto debs,
-# then initialize them for CubeSandbox. This is Strategy B of the riscv64 data
+# Install MySQL 8.4 + Redis natively on a riscv64 host, then initialize them for
+# CubeSandbox. MySQL is pulled from the XuanTie apt source (174) by default; the
+# Redis deb stays local. This is Strategy B of the riscv64 data
 # plane (see deploy/one-click/env.riscv64.example): CubeSandbox then connects via
 # CUBE_EXTERNAL_MYSQL_* / CUBE_EXTERNAL_REDIS_* and install.sh skips the bundled
 # docker-compose mysql/redis/minio services.
@@ -13,19 +14,23 @@
 # (OpenSSL 3.0) does not. Installing natively on the Yocto-built host avoids the
 # dependency mismatch entirely.
 #
-# Run as root ON THE RISCV64 HOST (e.g. the L1 testbed). The debs must already be
-# present on that host (copy them via the 9p share / scp first).
+# Run as root ON THE RISCV64 HOST (e.g. the L1 testbed). MySQL is fetched from the
+# XuanTie apt source (174) over the network; the Redis deb must already be present
+# on that host (copy it via the 9p share / scp first).
 #
 # Usage:
+#   # default: pull MySQL from the 174 apt source
+#   sudo REDIS_DEB=/path/redis_8.10.0-r0_riscv64.deb bash install-native-db.sh
+#   # offline: use a local MySQL deb instead
 #   sudo MYSQL_DEB=/path/mysql_8.4.11-r0_riscv64.deb \
-#        REDIS_DEB=/path/redis_8.10.0-r0_riscv64.deb \
-#        [DEB_DIR=/path/to/dependency-debs] \
-#        bash install-native-db.sh
+#        REDIS_DEB=/path/redis_8.10.0-r0_riscv64.deb bash install-native-db.sh
 #
-# DEB_DIR (optional): a directory of Yocto dependency debs (libcrypto3, libssl3,
-#   libstdc++6, libtinfo5, libtirpc3, ncurses, perl, ...) used with
-#   `dpkg -i "$DEB_DIR"/*.deb` when the running rootfs lacks them. On a matching
-#   Yocto rootfs they are usually already installed and DEB_DIR can be omitted.
+# Env:
+#   XUANTIE_APT_URL  174 rva23 common feed (default release/1.4.0); MySQL pull source
+#   MYSQL_PKG        apt package name to install (default: mysql)
+#   DEB_DIR          optional dir of dependency debs for the OFFLINE MYSQL_DEB path
+#                    (`dpkg -i "$DEB_DIR"/*.deb`); unneeded when pulling from 174
+#                    since apt resolves deps from the same feed.
 set -euo pipefail
 
 log() { printf '[install-native-db] %s\n' "$*" >&2; }
@@ -35,9 +40,12 @@ die() { printf '[install-native-db] ERROR: %s\n' "$*" >&2; exit 1; }
 [[ "$(uname -m)" == "riscv64" ]] || die "this script targets riscv64 hosts (found $(uname -m))"
 command -v dpkg >/dev/null 2>&1 || die "dpkg not found"
 
-MYSQL_DEB="${MYSQL_DEB:-}"
+MYSQL_DEB="${MYSQL_DEB:-}"          # optional: local deb for offline install
 REDIS_DEB="${REDIS_DEB:-}"
 DEB_DIR="${DEB_DIR:-}"
+XUANTIE_APT_URL="${XUANTIE_APT_URL:-http://114.55.254.174/xuantie/deb/release/1.4.0/kernel_6.6/rva23/common}"
+MYSQL_PKG="${MYSQL_PKG:-mysql}"
+MYSQL_APT_LIST="${MYSQL_APT_LIST:-/etc/apt/sources.list.d/xuantie-rva23.list}"
 
 # Cube DB credentials — must match env.riscv64.example / CUBE_EXTERNAL_*.
 MYSQL_DB="${CUBE_EXTERNAL_MYSQL_DB:-cube_mvp}"
@@ -46,7 +54,7 @@ MYSQL_PASSWORD="${CUBE_EXTERNAL_MYSQL_PASSWORD:-cube_pass}"
 MYSQL_ROOT_PASSWORD="${CUBE_EXTERNAL_MYSQL_ROOT_PASSWORD:-cube_root}"
 REDIS_PASSWORD="${CUBE_EXTERNAL_REDIS_PASSWORD:-ceuhvu123}"
 
-[[ -n "${MYSQL_DEB}" && -f "${MYSQL_DEB}" ]] || die "MYSQL_DEB not set or not a file: '${MYSQL_DEB}'"
+[[ -z "${MYSQL_DEB}" || -f "${MYSQL_DEB}" ]] || die "MYSQL_DEB set but not a file: '${MYSQL_DEB}'"
 [[ -n "${REDIS_DEB}" && -f "${REDIS_DEB}" ]] || die "REDIS_DEB not set or not a file: '${REDIS_DEB}'"
 
 # ── 1. Install dependency debs first (if provided), then MySQL + Redis ────────
@@ -56,8 +64,17 @@ if [[ -n "${DEB_DIR}" && -d "${DEB_DIR}" ]]; then
   apt-get -f install -y 2>/dev/null || true
 fi
 
-log "installing MySQL: ${MYSQL_DEB}"
-dpkg -i "${MYSQL_DEB}" 2>&1 | tail -5 || die "dpkg -i MySQL failed (are its library deps present? pass DEB_DIR=...)"
+if [[ -n "${MYSQL_DEB}" ]]; then
+  log "installing MySQL from local deb (offline): ${MYSQL_DEB}"
+  dpkg -i "${MYSQL_DEB}" 2>&1 | tail -5 || die "dpkg -i MySQL failed (are its library deps present? pass DEB_DIR=...)"
+  apt-get -f install -y 2>/dev/null || true
+else
+  log "pulling MySQL from 174 apt source: ${XUANTIE_APT_URL}"
+  command -v apt-get >/dev/null 2>&1 || die "apt-get not found; set MYSQL_DEB=/path/to.deb for offline install"
+  printf 'deb [trusted=yes] %s ./\n' "${XUANTIE_APT_URL}" > "${MYSQL_APT_LIST}"
+  apt-get update 2>&1 | tail -4 || true   # tolerate unrelated/broken host sources
+  apt-get install -y "${MYSQL_PKG}" 2>&1 | tail -10 || die "apt-get install ${MYSQL_PKG} from 174 failed"
+fi
 log "installing Redis: ${REDIS_DEB}"
 dpkg -i "${REDIS_DEB}" 2>&1 | tail -5 || die "dpkg -i Redis failed"
 

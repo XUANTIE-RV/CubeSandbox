@@ -4,8 +4,9 @@
 # compose parity; the RECOMMENDED riscv64 path is Strategy B, native install via
 # scripts/riscv64/install-native-db.sh — see env.riscv64.example).
 #
-# There is no official riscv64 MySQL image, so we package the Yocto-built
-# mysql_8.4.11 riscv64 deb. That deb links OpenSSL 3.4 (libcrypto3/libssl3 >=
+# There is no official riscv64 MySQL image, so we package the mysql_8.4.11
+# riscv64 deb pulled from the XuanTie apt source (174) by the build script.
+# That deb links OpenSSL 3.4 (libcrypto3/libssl3 >=
 # 3.4.0), glibc >= 2.38, libstdc++6 >= 14.3 — so the BASE image must provide
 # those. ubuntu:24.04 (OpenSSL 3.0) does NOT; use a base with OpenSSL 3.4.
 # Override BASE_IMAGE if your registry mirrors a different one.
