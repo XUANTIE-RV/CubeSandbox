@@ -291,6 +291,12 @@ jobs:
       - name: Prepare RISC-V cross builder (cold-build by default)
         env:
           PULL_FIRST: ${{ vars.RISCV64_BUILDER_PULL_FIRST }}
+          # Optional mirror for the riscv64 musl cross toolchain tarball
+          # (docker/Dockerfile.builder ARG RISCV64_MUSL_CROSS_URL). musl.cc is
+          # intermittently unreachable from GitHub-hosted runners; a fork can
+          # set the CUBE_RISCV64_MUSL_CROSS_URL repo variable to a mirror (the
+          # Dockerfile sha256 pin still applies). Empty -> Dockerfile default.
+          MUSL_URL: ${{ vars.CUBE_RISCV64_MUSL_CROSS_URL }}
         run: |
           set -euo pipefail
           # DEFAULT = self-contained cold build. `docker build` with
@@ -305,6 +311,7 @@ jobs:
               --build-arg BUILD_S3LVOL_DEPS=0 \
               --build-arg RUSTUP_DIST_SERVER=https://static.rust-lang.org \
               --build-arg RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup \
+              ${MUSL_URL:+--build-arg RISCV64_MUSL_CROSS_URL=${MUSL_URL}} \
               -t "${BUILDER_IMAGE_RISCV64_LOCAL}" \
               -f docker/Dockerfile.builder .
           }
