@@ -266,6 +266,7 @@ else
 		docker build $(if $(filter-out 0,$(BUILDER_FORCE_REBUILD)),--no-cache) $(BUILDER_BUILD_ARGS) \
 			--build-arg ENABLE_RISCV64_CROSS=1 \
 			--build-arg BUILD_S3LVOL_DEPS=0 \
+			$(if $(RISCV64_MUSL_CROSS_URL),--build-arg RISCV64_MUSL_CROSS_URL=$(RISCV64_MUSL_CROSS_URL)) \
 			-t $(BUILDER_IMAGE) -f $(BUILDER_DOCKERFILE) .; \
 	fi
 endif
