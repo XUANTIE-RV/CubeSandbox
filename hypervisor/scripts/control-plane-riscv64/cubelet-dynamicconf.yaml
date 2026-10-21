@@ -1,0 +1,37 @@
+# Cubelet dynamic config for the riscv64 C1 control-plane demo.
+# Derived from the hand-validated cube-l1 bed
+# (bed-cubetoolbox.tgz:Cubelet/dynamicconf/conf.yaml) with the meta-server
+# endpoints filled in (the bed's prepare-compute-role.sh sed'ed them at service
+# start; CI writes the final values directly).
+common:
+  enable_pf_mode: false
+  sandbox_exec_cmd_time_out: 5s
+  enable_sandbox_exec_cmd_before_exist: false
+  sandbox_exec_cmd_before_exist_log_out: false
+  sandbox_exec_cmd_before_exist:
+   - sh
+   - "/usr/local/cubetools/cube_exec_cmd_before_exist.sh"
+  cgroup_set_memory_reparent_file: ""
+  disable_host_cgroup: true
+  disable_host_netfile: true
+  default_dns_servers:
+    - 119.29.29.29
+  default_dns_searches: []
+  default_dns_options: []
+
+host:
+  scheduler_label: "default-cluster"
+  quota:
+    mcpu_limit: 0
+    mem_limit: ""
+    mvm_limit: 0
+    creation_concurrent_num: 0
+    paused_resource_release_ratio: 0.0
+  gc:
+    code_expiration_time: "72h"
+    image_expiration_time: "24h"
+
+meta_server_config:
+  meta_server_endpoint: "127.0.0.1:3010"
+  cubemaster_http_addr: "127.0.0.1:8089"
+  node_status_max_images: 40000

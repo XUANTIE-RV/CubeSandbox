@@ -1,0 +1,191 @@
+name: RISC-V Control-Plane Demo (no LLM)
+
+# Full-chain riscv64 validation WITHOUT any LLM: boot the C1 nested-TCG L1
+# (same backend as riscv64-snapshot-integration.yml), bring up the complete
+# CubeSandbox control plane INSIDE it (mysql + redis + cubeops + cubemaster +
+# templatecenter + cubelet + cube-api), register a code-interpreter template
+# through a local OCI registry, then run the no-LLM example
+# examples/openai-agents-code-interpreter/coldstart_snapshot_demo.py, which
+# drives the SDK -> E2B-compatible API (:3000) path end to end:
+# Sandbox.create (cold start, exercises cubelet's cube network setup: cube-dev
+# bridge + tap + cubevs eBPF) -> run_code -> create_snapshot -> warm restore
+# -> verify fs marker + in-memory kernel variable.
+#
+# This is the CI codification of the hand-validated cube-l1 bed run
+# (CODE-INTERPRETER-FULLCHAIN-STARTUP.log, RESULT: PASS 6/6). The in-L1
+# orchestration lives in hypervisor/scripts/run_control_plane_riscv64.sh; the
+# configs in hypervisor/scripts/control-plane-riscv64/ are derived verbatim
+# from the bed's cubetoolbox.
+#
+# workflow_dispatch-only on purpose: the whole chain runs under nested TCG
+# (template build alone took 18-35 min on the manual bed), so this is a
+# measurement/validation lane, not a PR gate. The PR-gate half of the no-LLM
+# example coverage is the "Examples sanity (no LLM)" job in
+# riscv64-snapshot-integration.yml.
+#
+# Control-plane assets (registry/crane/sandbox base image/py3+ci layer) are
+# riscv64 binaries not produced by this repo's build; they are mirrored from
+# the validated bed to this fork's `ci-assets` release and cached.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: riscv64-control-plane-demo-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  WORKLOADS_DIR: ${{ github.workspace }}/workloads
+  QEMU_VERSION: '11.1.1'
+
+jobs:
+  control-plane-demo:
+    name: riscv64 control plane + code-interpreter demo (no LLM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install guest tooling + riscv64 kernel cross toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # Same toolchain set as riscv64-snapshot-integration.yml (see that
+          # workflow's header for why qemu comes from a source build below).
+          sudo apt-get install -y \
+            qemu-utils cloud-image-utils mtools e2fsprogs \
+            openssh-client btrfs-progs \
+            gcc-riscv64-linux-gnu build-essential bc bison flex libelf-dev \
+            libssl-dev libncurses-dev dwarves cpio kmod rsync xz-utils patch
+          riscv64-linux-gnu-gcc --version | head -1
+
+      - name: Cache community QEMU ${{ env.QEMU_VERSION }} build
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WORKLOADS_DIR }}/qemu-install
+          key: qemu-${{ env.QEMU_VERSION }}-riscv64-softmmu-1
+
+      - name: Build community QEMU ${{ env.QEMU_VERSION }} (qemu-system-riscv64 only)
+        run: |
+          set -euo pipefail
+          chmod +x hypervisor/scripts/build_qemu_riscv64.sh
+          hypervisor/scripts/build_qemu_riscv64.sh
+
+      - name: Build riscv64 components
+        env:
+          RISCV64_MUSL_CROSS_URL: ${{ vars.CUBE_RISCV64_MUSL_CROSS_URL }}
+        run: |
+          set -euo pipefail
+          # Produces _output/bin/*-riscv64: cube-runtime, containerd-shim-cube-rs,
+          # cube-agent, cube-init AND the control plane (cubemaster(+cli),
+          # templatecenter, cubeops, cubelet, cube-api, cube-volume-s3,
+          # cubevsmapdump).
+          make all-riscv64 SKIP_BUILDER_IMAGE_CHECK=1 || make all-riscv64
+          make l2pause-riscv64 SKIP_BUILDER_IMAGE_CHECK=1 || make l2pause-riscv64
+
+      - name: Cache 7.2 guest kernel Image
+        id: cache-kernel
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WORKLOADS_DIR }}/Image
+          key: kernel-7.2-riscv64-v1-${{ hashFiles('configs/kernel-oc9.riscv64.config', 'configs/patches/riscv64-dax-zeropage-folio.patch', 'configs/patches/riscv64-kvm-zeropage-dirtylog.patch', 'scripts/build-kernel.sh', 'hypervisor/scripts/build_guest_kernel_riscv64.sh') }}
+
+      - name: Build 7.2 guest kernel Image (in-place, cross-compiled)
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          chmod +x hypervisor/scripts/build_guest_kernel_riscv64.sh
+          hypervisor/scripts/build_guest_kernel_riscv64.sh
+
+      - name: Cache riscv64 guest assets (opensbi fw + Ubuntu rootfs raw)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.WORKLOADS_DIR }}/fw_dynamic.bin
+            ${{ env.WORKLOADS_DIR }}/ubuntu-riscv64.raw
+          key: guest-assets-riscv64-v1-${{ vars.CUBE_RISCV64_ROOTFS_URL || 'noble-current' }}
+
+      - name: Fetch riscv64 guest assets (opensbi + rootfs)
+        env:
+          CUBE_RISCV64_ROOTFS_URL: ${{ vars.CUBE_RISCV64_ROOTFS_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${WORKLOADS_DIR}"
+          chmod +x hypervisor/scripts/fetch_guest_assets_riscv64.sh
+          hypervisor/scripts/fetch_guest_assets_riscv64.sh
+
+      - name: Build L2 guest OS image (pmem0) + cube-agent ext4 (pmem1)
+        run: |
+          set -euo pipefail
+          chmod +x deploy/one-click/build-guest-image-riscv64.sh deploy/one-click/build-agent-ext4.sh
+          OUTPUT_DIR="${WORKLOADS_DIR}" \
+            ONE_CLICK_CUBE_INIT_BIN="${GITHUB_WORKSPACE}/_output/bin/cube-init-riscv64" \
+            ONE_CLICK_L2PAUSE_BIN="${GITHUB_WORKSPACE}/_output/bin/l2pause-riscv64" \
+            ./deploy/one-click/build-guest-image-riscv64.sh
+          OUTPUT_DIR="${WORKLOADS_DIR}" \
+            ONE_CLICK_CUBE_AGENT_BIN="${GITHUB_WORKSPACE}/_output/bin/cube-agent-riscv64" \
+            ./deploy/one-click/build-agent-ext4.sh
+          ls -la "${WORKLOADS_DIR}"/cube-guest-image-cpu.img "${WORKLOADS_DIR}"/cube-agent.ext4
+
+      - name: Generate cube snapshot assets (spec + min.tar)
+        run: |
+          set -euo pipefail
+          chmod +x hypervisor/scripts/gen_cube_snapshot_assets_riscv64.sh
+          OUTPUT_DIR="${WORKLOADS_DIR}" CUBE_ARCH=riscv64 \
+            hypervisor/scripts/gen_cube_snapshot_assets_riscv64.sh
+
+      - name: Cache control-plane assets (registry/crane/sandbox image/ci layer)
+        id: cache-cp-assets
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WORKLOADS_DIR }}/control-plane
+          key: control-plane-assets-riscv64-v1
+
+      - name: Fetch control-plane assets from the ci-assets release
+        if: steps.cache-cp-assets.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${WORKLOADS_DIR}/control-plane"
+          base="https://github.com/${{ github.repository }}/releases/download/ci-assets"
+          for a in registry-riscv64 crane-riscv64 sandbox-riscv64.tar py3-ci-layer-persist.tar.gz; do
+            echo "=== fetch ${a} ==="
+            curl -fSL --retry 3 -H "Authorization: Bearer ${GH_TOKEN}" \
+              -o "${WORKLOADS_DIR}/control-plane/${a}" "${base}/${a}"
+            ls -la "${WORKLOADS_DIR}/control-plane/${a}"
+          done
+
+      - name: Run C1 control-plane demo (boot L1 under QEMU TCG, full chain inside)
+        env:
+          BIN_DIR: ${{ github.workspace }}/_output/bin
+          L1_SMP: ${{ vars.RISCV64_L1_SMP || '4' }}
+          # 6G: the control plane (mysqld + redis + 5 Go services) shares the L1
+          # with the L2 microVMs; the manual bed used a 6G L1 for the same chain.
+          L1_MEM: ${{ vars.RISCV64_L1_CP_MEM || '6G' }}
+          RUNDIR: ${{ runner.temp }}/c1-l1
+          QEMU: ${{ env.WORKLOADS_DIR }}/qemu-install/bin/qemu-system-riscv64
+          RUN_MODE: control-plane
+        run: |
+          set -euo pipefail
+          chmod +x hypervisor/scripts/run_c1_nested_riscv64.sh \
+                   hypervisor/scripts/run_control_plane_riscv64.sh
+          hypervisor/scripts/run_c1_nested_riscv64.sh
+
+      - name: Upload L1 / control-plane logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: riscv64-c1-control-plane-logs
+          path: |
+            ${{ runner.temp }}/c1-l1/serial.log
+            ${{ runner.temp }}/c1-l1/control-plane.log
+            ${{ runner.temp }}/c1-l1/qemu-guest-errors.log
+          if-no-files-found: ignore
+          retention-days: 7
