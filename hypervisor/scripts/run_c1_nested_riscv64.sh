@@ -201,6 +201,14 @@ done
 info "L1 up: $(${SSH} 'uname -r; nproc; test -e /dev/kvm && echo KVM_YES || echo KVM_NO' 2>/dev/null | tr '\n' ' ')"
 ${SSH} 'test -e /dev/kvm' || die "L1 has no /dev/kvm -- QEMU H-extension not exposed to the L1"
 
+# Full L1 boot log (OpenSBI + kernel + cloud-init up to ssh-up), unfiltered --
+# on a CI runner the job log is the primary debug surface. SER_OFF records how
+# much was shown; the post-integration delta dump below prints the remainder.
+echo "=== L1 boot: full serial.log (unfiltered) ==="
+cat "${SERIAL}"
+echo "=== end L1 boot serial.log ==="
+SER_OFF=$(stat -c%s "${SERIAL}" 2>/dev/null || echo 0)
+
 # --- run the integration test INSIDE the L1 (nested KVM) ---------------------
 # Nested TCG intermittently wedges the L2 vCPUs entirely (observed twice: zero
 # guest progress for 291s and 900s right after guest-init prints "init mount
@@ -262,6 +270,17 @@ done
 echo "=== full integration.log ==="
 cat "${RUNDIR}/integration.log"
 echo "=== end integration.log ==="
+# L1 serial output since the ssh-up dump above (cloud-init completion, any L1
+# kernel oops/warning during the nested run), unfiltered.
+ser_size=$(stat -c%s "${SERIAL}" 2>/dev/null || echo 0)
+echo "=== L1 serial.log during integration: bytes ${SER_OFF}..${ser_size} (unfiltered) ==="
+if [[ "${ser_size}" -gt "${SER_OFF}" ]]; then tail -c +$((SER_OFF + 1)) "${SERIAL}"; else echo "(no new output)"; fi
+echo "=== end L1 serial delta ==="
+if [[ -s "${RUNDIR}/qemu-guest-errors.log" ]]; then
+  echo "=== qemu -d guest_errors log (full, unfiltered) ==="
+  cat "${RUNDIR}/qemu-guest-errors.log"
+  echo "=== end qemu guest_errors ==="
+fi
 if grep -qiE 'arena already|internal error: segfault' "${RUNDIR}/integration.log"; then
   die "guest-memory corruption detected in the integration log"
 fi

@@ -179,6 +179,26 @@ info "assert VsockServerReady + task RUNNING (boot timeout ${BOOT_TIMEOUT}s)"
 # the guest-init sys-ctrl write the VMM logs as "vsock server ready" in
 # ${VMM_LOG}. Accept either source.
 VMM_LOG="${VMM_LOG:-/data/log/CubeVmm/vmm.log}"
+
+# Full-log display helpers. On a CI runner the job log is the primary debug
+# surface, so every phase's logs are printed complete and unfiltered. vmm.log
+# accumulates across phases; VMM_OFF tracks how much has been shown so each
+# phase prints exactly its own delta (bytes, never lines -- no filtering).
+VMM_OFF=0
+dump_log_full() { # dump_log_full <path> <label>
+  local f="$1" label="$2"
+  echo "=== ${label}: ${f} (full, unfiltered) ==="
+  if [[ -s "${f}" ]]; then cat "${f}"; else echo "(file missing or empty: ${f})"; fi
+  echo "=== end ${label} ==="
+}
+dump_vmm_delta() { # dump_vmm_delta <label>
+  local label="$1" size=0
+  [[ -f "${VMM_LOG}" ]] && size="$(stat -c%s "${VMM_LOG}")"
+  echo "=== ${label}: ${VMM_LOG} bytes ${VMM_OFF}..${size} (unfiltered) ==="
+  if [[ "${size}" -gt "${VMM_OFF}" ]]; then tail -c +$((VMM_OFF + 1)) "${VMM_LOG}"; else echo "(no new output)"; fi
+  echo "=== end ${label} ==="
+  VMM_OFF=${size}
+}
 ready=0
 for _ in $(seq 1 "${BOOT_TIMEOUT}"); do
   { grep -qi "VsockServerReady" "${SERIAL}" 2>/dev/null || grep -qi "vsock server ready" "${VMM_LOG}" 2>/dev/null; } && { ready=1; break; }
@@ -187,6 +207,12 @@ done
 state="$(ctr --address "${SOCK}" -n default task ls 2>/dev/null | awk -v id="${SANDBOX_ID}" '$1==id{print $3}')"
 [[ "${ready}" == "1" ]] || { ctr --address "${SOCK}" -n default task kill -s SIGKILL "${SANDBOX_ID}" 2>/dev/null || true; die "vsock server ready not seen in ${SERIAL} or ${VMM_LOG} (task state=${state:-?})"; }
 echo "  boot: vsock server ready OK, task state=${state:-RUNNING}"
+
+# Full L2 boot logs, unfiltered: the guest serial console (empty under
+# ConsoleOutputMode::Tty -- printed anyway so that fact is visible) and the
+# Cube-Hypervisor VMM log (device setup, memory map, vCPU start, vsock ready).
+dump_log_full "${SERIAL}" "L2 boot: guest serial console"
+dump_vmm_delta "L2 boot: Cube-Hypervisor"
 
 # --- 3b) dax assertion (riscv64 7.2 FS_DAX) ---------------------------------
 # The root pmem boots with rootflags=dax (CubeShim config.rs::new) and both the
@@ -247,6 +273,11 @@ case "${SNAPSHOT_MODE:-shim}" in
       --kernel "${TB}/cube-kernel-scf/vmlinux" || die "cube-runtime snapshot --app-snapshot failed"
     [[ -s "${SNAP_DIR}/metadata.json" && -s "${SNAP_DIR}/snapshot/memory-ranges" ]] \
       || die "snapshot artifacts incomplete under ${SNAP_DIR}"
+    # Full snapshot-phase VMM log (vm.pause -> vm.snapshot -> vm.resume), unfiltered.
+    dump_vmm_delta "snapshot create (${SANDBOX_ID})"
+    echo "=== snapshot artifacts under ${SNAP_DIR} (unfiltered) ==="
+    ls -lR "${SNAP_DIR}"
+    echo "=== end snapshot artifacts ==="
     RESTORE_ID="restore-${SANDBOX_ID}"
     ctr --address "${SOCK}" -n default run -d --rootfs --runtime io.containerd.cube.rs \
         -c "${SPEC_RESTORE}" "${RESTORE_ID}" || die "restore ctr run failed (spec=${SPEC_RESTORE})"
@@ -261,6 +292,8 @@ case "${SNAPSHOT_MODE:-shim}" in
     done
     [[ "${rstate}" == "RUNNING" ]] || die "restored sandbox ${RESTORE_ID} did not reach RUNNING (state=${rstate:-?})"
     echo "  restore: ${RESTORE_ID} RUNNING; verify marker='${MARKER}' + mem var via agent exec (TODO on runner)"
+    # Full restore-phase VMM log (restore load -> vCPU resume -> RUNNING), unfiltered.
+    dump_vmm_delta "restore (${RESTORE_ID})"
     ;;
   *) die "unknown SNAPSHOT_MODE=${SNAPSHOT_MODE} (expected: shim|demo)" ;;
 esac
@@ -271,6 +304,16 @@ for id in "${SANDBOX_ID}" "restore-${SANDBOX_ID}"; do
   ctr --address "${SOCK}" -n default task kill -s SIGKILL "${id}" 2>/dev/null || true
   ctr --address "${SOCK}" -n default task rm -f "${id}" 2>/dev/null || true
   ctr --address "${SOCK}" -n default container rm "${id}" 2>/dev/null || true
+done
+
+# Full daemon-side logs for the whole lifecycle (import/create/snapshot/restore/
+# teardown), unfiltered: containerd-cube itself, the per-sandbox CubeShim logs,
+# and any VMM output not yet shown.
+dump_vmm_delta "teardown"
+dump_log_full "/data/log/CubeVmm/containerd.log" "containerd-cube daemon"
+for f in /data/log/CubeShim/*; do
+  [[ -f "${f}" ]] || continue
+  dump_log_full "${f}" "CubeShim log"
 done
 
 echo "RISCV64_INTEGRATION: PASS (boot + vsock$([[ ${QUICK} == 1 ]] && echo ' + snapshot/restore'))"
