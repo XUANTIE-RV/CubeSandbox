@@ -36,10 +36,6 @@
 #
 # Usage: run_integration_tests_riscv64.sh [--quick]
 #   --quick  core smoke only: boot + vsock + one snapshot/restore (default).
-#
-# TODO(verify on runner): the exact toolbox layout and the snapshot CLI are
-# testbed-specific; the placeholders below must be pinned to the runner's staged
-# paths before first green run.
 
 set -euo pipefail
 
@@ -199,13 +195,13 @@ fi
 # --- 4) snapshot -> restore -> verify (the P4/P5 equivalent) ----------------
 info "create_snapshot -> restore -> verify fs marker + memory var"
 MARKER="riscv64-ci-marker-$$"
-# TODO(verify on runner): the snapshot/restore invocation is testbed-specific.
 # Two supported paths:
 #   (a) control-plane: examples/openai-agents-code-interpreter/coldstart_snapshot_demo.py
 #       (Sandbox.create -> run_code -> create_snapshot -> create(template=snapshot_id)),
 #       needs cube-api/cubemaster/cubelet running; or
-#   (b) shim-level: cube-snapshot create on ${SANDBOX_ID} -> ${REST}, then
-#       `ctr run -c ${SPEC_RESTORE}` a new sandbox from the snapshot and verify.
+#   (b) shim-level (default): cube-runtime snapshot --app-snapshot on
+#       ${SANDBOX_ID} -> ${REST}/<cpu>C<mem>M, then `ctr run -c ${SPEC_RESTORE}`
+#       a new sandbox from the snapshot and verify.
 # The assertions below are the pass criteria either path must satisfy:
 #   * snapshot create returns a snapshot_id / writes ${REST} state
 #   * restore boots a NEW sandbox whose fs marker AND in-memory var survive
@@ -218,8 +214,27 @@ case "${SNAPSHOT_MODE:-shim}" in
       || die "coldstart_snapshot_demo.py did not report RESULT: PASS"
     ;;
   shim)
-    command -v cube-snapshot >/dev/null 2>&1 || die "SNAPSHOT_MODE=shim needs cube-snapshot on PATH (or use SNAPSHOT_MODE=demo)"
-    cube-snapshot create --address "${SOCK}" --id "${SANDBOX_ID}" --base "${REST}" || die "cube-snapshot create failed"
+    # cube-runtime is built in-repo (Makefile shim-riscv64 -> _output/bin) and
+    # links the SAME shim snapshot library (CubeShim/shim/src/snapshot) the
+    # external cube-snapshot CLI wraps: chapi PUT /api/v1/vm.pause ->
+    # vm.snapshot(file://<path>/snapshot) -> store metadata.json -> vm.resume.
+    # The product-side warmup uses it too (Cubelet/config/snapshot.sh). Unlike
+    # the external CLI (which derives args from containerd via --address/--id),
+    # every arg is explicit. --path MUST be the <cpu>C<mem>M dir named in
+    # SPEC_RESTORE's cube.vm.snapshot.memory_vol_url, and --resource MUST equal
+    # the restore spec's vmmres -- the restore-side SnapshotInfo eq() compares
+    # both (gen_cube_snapshot_assets_riscv64.sh defaults: 2 vcpu / 512 MiB).
+    CUBE_VCPU="${CUBE_VCPU:-2}"
+    CUBE_MEMORY_MB="${CUBE_MEMORY_MB:-512}"
+    SNAP_DIR="${REST}/${CUBE_VCPU}C${CUBE_MEMORY_MB}M"
+    "${OUTPUT_BIN}/cube-runtime-riscv64" snapshot --app-snapshot \
+      --vm-id "${SANDBOX_ID}" \
+      --path "${SNAP_DIR}" \
+      --resource "{\"cpu\":${CUBE_VCPU},\"memory\":${CUBE_MEMORY_MB}}" \
+      --disk '[]' --pmem '[]' --force \
+      --kernel "${TB}/cube-kernel-scf/vmlinux" || die "cube-runtime snapshot --app-snapshot failed"
+    [[ -s "${SNAP_DIR}/metadata.json" && -s "${SNAP_DIR}/snapshot/memory-ranges" ]] \
+      || die "snapshot artifacts incomplete under ${SNAP_DIR}"
     RESTORE_ID="restore-${SANDBOX_ID}"
     ctr --address "${SOCK}" -n default run -d --rootfs --runtime io.containerd.cube.rs \
         -c "${SPEC_RESTORE}" "${RESTORE_ID}" || die "restore ctr run failed (spec=${SPEC_RESTORE})"
