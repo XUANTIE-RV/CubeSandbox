@@ -23,7 +23,8 @@ test_docker_bin_is_snap() {
     local alias
     alias="$(mktemp)"
     ln -sf /usr/bin/snap "${alias}"
-    docker_bin_is_snap "${alias}" || fail "symlink to /usr/bin/snap should be snap"
+    docker_bin_is_snap "${alias}" \
+      || fail "symlink to /usr/bin/snap should be snap (alias=${alias}, readlink -f alias=$(readlink -f "${alias}"), /usr/bin/snap => $(readlink /usr/bin/snap 2>/dev/null || echo 'not a symlink'))"
     rm -f "${alias}"
   fi
 }

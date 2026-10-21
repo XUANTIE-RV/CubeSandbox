@@ -2992,10 +2992,24 @@ detect_pkg_manager() {
 # Snap Docker cannot read /usr/local/services (#1753).
 # Checks the docker CLI on PATH; assumes it belongs to the running daemon.
 docker_bin_is_snap() {
-  local p="${1:-}" resolved
+  local p="${1:-}"
   [[ -n "${p}" ]] || return 1
-  resolved="$(readlink -f "${p}" 2>/dev/null || true)"
-  [[ "${p}" == /snap/* || "${resolved}" == /snap/* || "${resolved}" == /usr/bin/snap ]]
+  # Walk the symlink chain hop by hop. readlink -f is NOT usable here: on
+  # images where /usr/bin/snap is itself a symlink (e.g. -> /usr/lib/snapd/snap,
+  # observed on the ubuntu-24.04-arm GitHub runner), full resolution goes PAST
+  # /usr/bin/snap and the snap-ness of an alias pointing at it would be missed.
+  local hop="${p}" target
+  while :; do
+    [[ "${hop}" == /snap/* || "${hop}" == /usr/bin/snap ]] && return 0
+    [[ -L "${hop}" ]] || return 1
+    target="$(readlink "${hop}" 2>/dev/null || true)"
+    [[ -n "${target}" ]] || return 1
+    if [[ "${target}" == /* ]]; then
+      hop="${target}"
+    else
+      hop="$(dirname "${hop}")/${target}"
+    fi
+  done
 }
 
 reject_snap_docker() {
