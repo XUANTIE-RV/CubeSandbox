@@ -331,7 +331,12 @@ case "${RUN_MODE}" in
     # a failed job whose full logs are dumped by the in-L1 script's EXIT trap.
     info "running the control-plane demo inside the L1 (RUN_MODE=control-plane)"
     set +e
-    ${SSH} 'sudo bash -c "
+    # timeout: bound any L1-side wedge well under the 330-min job cap; the
+    # scripted internal budgets (bring-up ~30m + template poll 90m + demo 15m
+    # + dumps) sum to ~2.5h. stdin is detached both here and per-daemon in the
+    # in-L1 script: daemons inheriting the ssh channel's stdin held the session
+    # open for 2.5h after the script had FAILED (run 39640853172).
+    timeout 10200 ${SSH} 'sudo bash -c "
       timeout 300 cloud-init status --wait >/dev/null 2>&1 || true
       mkdir -p /data
       mountpoint -q /data || mount /dev/vdb /data 2>/dev/null || true
@@ -343,8 +348,8 @@ case "${RUN_MODE}" in
         sleep 3
       done
       [[ -s /mnt/share/run_control_plane_riscv64.sh ]] || { echo \"FATAL: 9p share never populated\"; exit 1; }
-      bash /mnt/share/run_control_plane_riscv64.sh
-    "' 2>&1 | tee "${RUNDIR}/control-plane.log"
+      bash /mnt/share/run_control_plane_riscv64.sh < /dev/null
+    "' </dev/null 2>&1 | tee "${RUNDIR}/control-plane.log"
     rc=${PIPESTATUS[0]}
     set -e
 

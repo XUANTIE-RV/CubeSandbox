@@ -39,7 +39,7 @@ TB="${TB:-/usr/local/services/cubetoolbox}"
 DEMO_TIMEOUT="${DEMO_TIMEOUT:-900}"
 TPL_POLL_MAX="${TPL_POLL_MAX:-270}"   # 270 * 20s = 90 min (bed: 18-35 min under TCG)
 
-info() { echo "[cp] $*"; }
+info() { echo "[cp] $(date +%H:%M:%S) $*"; }
 die()  { echo "[cp] ERROR: $*" >&2; exit 2; }
 
 dump_full() { local f="$1"
@@ -172,7 +172,7 @@ for i in $(seq 1 15); do pgrep -x redis-server >/dev/null || break; sleep 2; don
 if pgrep -x redis-server >/dev/null; then die "systemd redis would not stop"; fi
 mkdir -p /var/lib/cube-redis
 nohup redis-server --bind 127.0.0.1 --port 6379 --requirepass ceuhvu123 \
-  --dir /var/lib/cube-redis >/var/log/cube-redis.log 2>&1 &
+  --dir /var/lib/cube-redis >/var/log/cube-redis.log 2>&1 </dev/null &
 i=0
 until redis-cli -h 127.0.0.1 -p 6379 -a ceuhvu123 ping 2>/dev/null | grep -q PONG; do
   i=$((i+1)); [[ ${i} -ge 60 ]] && die "redis not ready (see /var/log/cube-redis.log)"
@@ -240,7 +240,7 @@ CUBE_OPS_BIND=0.0.0.0:3010 CUBE_OPS_LOG_LEVEL=info \
   CUBE_SANDBOX_MYSQL_USER=cube CUBE_SANDBOX_MYSQL_PASSWORD=cube_pass \
   CUBE_SANDBOX_MYSQL_DB=cube_mvp \
   REDIS_HOST=127.0.0.1 REDIS_PORT=6379 REDIS_PASSWORD=ceuhvu123 REDIS_DB=0 \
-  nohup "${TB}/CubeOps/bin/cubeops" >/var/log/cube-cubeops.log 2>&1 &
+  nohup "${TB}/CubeOps/bin/cubeops" >/var/log/cube-cubeops.log 2>&1 </dev/null &
 
 wait_port() { local port="$1" name="$2" n=0
   until (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; do
@@ -252,17 +252,23 @@ wait_port() { local port="$1" name="$2" n=0
 wait_port 3010 cubeops
 
 info "start cubemaster (:8089)"
+# Shared template-callback secret: cubemaster attaches it to job forwards,
+# templatecenter + cubemaster's callback endpoint both verify it. With it
+# unset both ends fail closed (TC 503 "not configured", run 39640853172).
+CALLBACK_TOKEN="$(head -c 24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 32)"
 CUBE_MASTER_CONFIG_PATH="${TB}/CubeMaster/conf.yaml" \
   CUBEMASTER_ROOTFS_ARTIFACT_STORE_DIR=/data/CubeMaster/storage \
   CUBE_TEMPLATE_CENTER_ADDR=http://127.0.0.1:8090 \
-  nohup "${TB}/CubeMaster/bin/cubemaster" >/var/log/cube-cubemaster.log 2>&1 &
+  CUBE_TEMPLATE_CALLBACK_TOKEN="${CALLBACK_TOKEN}" \
+  nohup "${TB}/CubeMaster/bin/cubemaster" >/var/log/cube-cubemaster.log 2>&1 </dev/null &
 wait_port 8089 cubemaster
 
 info "start templatecenter (:8090)"
 CUBE_TEMPLATE_CENTER_CONFIG_PATH="${TB}/CubeTemplateCenter/conf.yaml" \
   CUBE_MASTER_ADDR=http://127.0.0.1:8089 \
   CUBE_TEMPLATE_CENTER_ARTIFACT_STORE_DIR=/data/CubeMaster/storage \
-  nohup "${TB}/CubeTemplateCenter/bin/templatecenter" >/var/log/cube-templatecenter.log 2>&1 &
+  CUBE_TEMPLATE_CALLBACK_TOKEN="${CALLBACK_TOKEN}" \
+  nohup "${TB}/CubeTemplateCenter/bin/templatecenter" >/var/log/cube-templatecenter.log 2>&1 </dev/null &
 wait_port 8090 templatecenter
 
 info "start cubelet (:9999)"
@@ -270,14 +276,14 @@ CUBE_SANDBOX_NODE_IP="${CUBE_SANDBOX_NODE_IP}" \
   nohup "${TB}/Cubelet/bin/cubelet" \
     --config "${TB}/Cubelet/config/config.toml" \
     --dynamic-conf-path "${TB}/Cubelet/dynamicconf/conf.yaml" \
-    >/var/log/cube-cubelet.log 2>&1 &
+    >/var/log/cube-cubelet.log 2>&1 </dev/null &
 wait_port 9999 cubelet
 wait_port 9998 cubelet-http
 
 info "start cube-api (:3000)"
 LOG_DIR=/data/log/CubeAPI CUBE_API_BIND=0.0.0.0:3000 \
   CUBE_API_SANDBOX_DOMAIN=cube.app CUBE_MASTER_ADDR=http://127.0.0.1:8089 \
-  nohup "${TB}/CubeAPI/bin/cube-api" >/var/log/cube-api.log 2>&1 &
+  nohup "${TB}/CubeAPI/bin/cube-api" >/var/log/cube-api.log 2>&1 </dev/null &
 wait_port 3000 cube-api
 
 info "wait for the node to register with CubeOps"
