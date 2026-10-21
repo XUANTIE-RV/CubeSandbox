@@ -259,7 +259,7 @@ RUN set -eux; \
 
 RUN set -eux; \
     if [ "${ENABLE_RISCV64_CROSS}" = 1 ]; then \
-        curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 --connect-timeout 30 \
+        curl -fsSL --retry 5 --retry-delay 10 --connect-timeout 30 \
             "${RISCV64_MUSL_CROSS_URL}" -o /tmp/riscv64-linux-musl-cross.tgz; \
         echo "${RISCV64_MUSL_CROSS_SHA256}  /tmp/riscv64-linux-musl-cross.tgz" | sha256sum -c -; \
         mkdir -p /opt/riscv64-linux-musl-cross; \
