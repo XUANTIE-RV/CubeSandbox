@@ -148,6 +148,25 @@ if [[ ! -s "${CONTAINERD_TAR}" ]]; then
 fi
 cp -f "${CONTAINERD_TAR}" "${SHARE}/"
 
+# Sweep helper run between integration attempts (nested-TCG flake retry): kill a
+# zombie VMM left behind by a timed-out create and drop its containerd
+# task/container, so the retry starts with the L1's full RAM. Kept as a file in
+# the 9p share (not an inline ssh command) to avoid triple-nested quoting; the
+# pkill patterns use the [r] bracket trick so the sweep cannot match itself.
+cat > "${SHARE}/c1-sweep.sh" <<'EOF'
+#!/usr/bin/env bash
+pkill -f 'cube-hyperviso[r]' 2>/dev/null || true
+sleep 2
+for tid in $(ctr --address /run/containerd-cube.sock -n default task ls 2>/dev/null | awk 'NR>1{print $1}'); do
+  ctr --address /run/containerd-cube.sock -n default task kill -s SIGKILL "${tid}" 2>/dev/null || true
+  ctr --address /run/containerd-cube.sock -n default task rm -f "${tid}" 2>/dev/null || true
+done
+for cid in $(ctr --address /run/containerd-cube.sock -n default container ls 2>/dev/null | awk 'NR>1{print $1}'); do
+  ctr --address /run/containerd-cube.sock -n default container rm "${cid}" 2>/dev/null || true
+done
+pkill -f 'containerd-shim-cube-r[s]' 2>/dev/null || true
+EOF
+
 # --- boot the L1 (QEMU TCG, H-ext + AIA), host-forward ssh, 9p share ---------
 SERIAL="${RUNDIR}/serial.log"; PIDFILE="${RUNDIR}/qemu.pid"
 info "booting L1: ${QEMU} -cpu max -smp ${L1_SMP} -m ${L1_MEM} (TCG)"
@@ -180,35 +199,69 @@ info "L1 up: $(${SSH} 'uname -r; nproc; test -e /dev/kvm && echo KVM_YES || echo
 ${SSH} 'test -e /dev/kvm' || die "L1 has no /dev/kvm -- QEMU H-extension not exposed to the L1"
 
 # --- run the integration test INSIDE the L1 (nested KVM) ---------------------
-info "running snapshot/restore integration inside the L1"
-set +e
-${SSH} 'sudo bash -c "
-  mountpoint -q /mnt/share || { mkdir -p /mnt/share && mount -t 9p -o trans=virtio,version=9p2000.L c1share /mnt/share; }
-  mountpoint -q /data || mount /dev/vdb /data 2>/dev/null || true
-  export WORKLOADS_DIR=/mnt/share
-  # stage the assets where run_integration_tests_riscv64.sh expects them
-  cp -f /mnt/share/Image /mnt/share/vmlinux /mnt/share/fw_dynamic.bin /mnt/share/cube-*.img /mnt/share/cube-*.ext4 /mnt/share/cube-*.json /mnt/share/cube-min.tar /mnt/share/*-riscv64 /data/ 2>/dev/null || true
-  # provision containerd/ctr + register the cube shim (io.containerd.cube.rs ->
-  # containerd-shim-cube-rs per containerd shim naming)
-  tar -xzf /mnt/share/containerd-*.tar.gz -C /usr/local
-  install -m 0755 /data/containerd-shim-cube-rs-riscv64 /usr/local/bin/containerd-shim-cube-rs
-  chmod +x /mnt/share/run_integration_tests_riscv64.sh
-  # The integration script resolves REPO from its own path (/mnt/share), so its
-  # default OUTPUT_BIN=/mnt/_output/bin never exists; the binaries live in /data.
-  WORKLOADS_DIR=/data OUTPUT_BIN=/data bash /mnt/share/run_integration_tests_riscv64.sh --quick
-"' 2>&1 | tee "${RUNDIR}/integration.log"
-# Without set +e, pipefail aborts at the pipeline above on integration failure,
-# making the rc capture and the log assertions below dead code.
-rc=${PIPESTATUS[0]}
-set -e
+# Nested TCG intermittently wedges the L2 vCPUs entirely (observed twice: zero
+# guest progress for 291s and 900s right after guest-init prints "init mount
+# finish", i.e. inside the dax mount of /dev/pmem1; a hung guest never recovers
+# while an identical retry boots in ~20-60s). Attempt the in-L1 integration up
+# to INTEGRATION_ATTEMPTS times, sweeping leftover VMM/tasks/containers between
+# attempts so a zombie guest does not eat the L1's RAM. All attempts append to
+# the same integration.log.
+INTEGRATION_ATTEMPTS="${INTEGRATION_ATTEMPTS:-3}"
+rc=1
+tee_flags=""
+for attempt in $(seq 1 "${INTEGRATION_ATTEMPTS}"); do
+  if [[ "${attempt}" -gt 1 ]]; then
+    info "sweeping leftovers in the L1 before attempt ${attempt}/${INTEGRATION_ATTEMPTS}"
+    ${SSH} 'sudo bash /mnt/share/c1-sweep.sh' || true
+    tee_flags="-a"
+  fi
+  info "running snapshot/restore integration inside the L1 (attempt ${attempt}/${INTEGRATION_ATTEMPTS})"
+  set +e
+  ${SSH} 'sudo bash -c "
+    # sshd answers before cloud-init runcmd finishes (mkfs.btrfs /dev/vdb +
+    # mkdir/mount /data); observed: attempt 1 died on \"cp: target /data/: No
+    # such file or directory\". Wait for cloud-init (bounded) before staging.
+    timeout 300 cloud-init status --wait >/dev/null 2>&1 || true
+    mkdir -p /data
+    mountpoint -q /data || mount /dev/vdb /data 2>/dev/null || true
+    export WORKLOADS_DIR=/mnt/share
+    # The /data race above is the observed attempt-1 killer; the 9p mount has
+    # not been seen failing, but verify the share is populated anyway and retry
+    # the mount before staging -- a cheap guard that fails fast so the outer
+    # retry gets a real attempt instead of a staging ghost.
+    for i in 1 2 3 4 5; do
+      mountpoint -q /mnt/share || { mkdir -p /mnt/share && mount -t 9p -o trans=virtio,version=9p2000.L c1share /mnt/share; }
+      if [[ -s /mnt/share/cube-runtime-riscv64 && -s /mnt/share/Image ]]; then break; fi
+      echo \"share not populated (try $i); remounting\"
+      mountpoint -q /mnt/share && umount /mnt/share
+      sleep 3
+    done
+    [[ -s /mnt/share/cube-runtime-riscv64 && -s /mnt/share/Image ]] || { echo \"FATAL: 9p share never populated\"; exit 1; }
+    # stage the assets where run_integration_tests_riscv64.sh expects them
+    cp -f /mnt/share/Image /mnt/share/vmlinux /mnt/share/fw_dynamic.bin /mnt/share/cube-*.img /mnt/share/cube-*.ext4 /mnt/share/cube-*.json /mnt/share/cube-min.tar /mnt/share/*-riscv64 /data/ || { echo \"FATAL: asset cp from 9p share failed\"; exit 1; }
+    # provision containerd/ctr + register the cube shim (io.containerd.cube.rs ->
+    # containerd-shim-cube-rs per containerd shim naming)
+    tar -xzf /mnt/share/containerd-*.tar.gz -C /usr/local
+    install -m 0755 /data/containerd-shim-cube-rs-riscv64 /usr/local/bin/containerd-shim-cube-rs
+    chmod +x /mnt/share/run_integration_tests_riscv64.sh
+    # The integration script resolves REPO from its own path (/mnt/share), so its
+    # default OUTPUT_BIN=/mnt/_output/bin never exists; the binaries live in /data.
+    WORKLOADS_DIR=/data OUTPUT_BIN=/data bash /mnt/share/run_integration_tests_riscv64.sh --quick
+  "' 2>&1 | tee ${tee_flags} "${RUNDIR}/integration.log"
+  # Without set +e, pipefail aborts at the pipeline above on integration failure,
+  # making the rc capture and the log assertions below dead code.
+  rc=${PIPESTATUS[0]}
+  set -e
+  info "integration attempt ${attempt} rc=${rc}"
+  [[ "${rc}" -eq 0 ]] && break
+done
 
-info "integration rc=${rc}"
 echo "=== restore/corruption assertions ==="
 grep -iE 'RUNNING|snapshot success|arena already|segfault|corrupt|RESTORE_DONE' "${RUNDIR}/integration.log" || true
 if grep -qiE 'arena already|internal error: segfault' "${RUNDIR}/integration.log"; then
   die "guest-memory corruption detected in the integration log"
 fi
-[[ "${rc}" -eq 0 ]] || die "integration script failed rc=${rc}"
+[[ "${rc}" -eq 0 ]] || die "integration script failed rc=${rc} after ${attempt} attempt(s)"
 info "C1 snapshot/restore PASSED"
 
 # logs are collected by the caller from ${RUNDIR}; keep them on success too

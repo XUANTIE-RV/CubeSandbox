@@ -28,6 +28,10 @@
 # Override any of them via SPEC / SPEC_RESTORE / CUBE_MIN_TAR / GUEST_OS_IMAGE /
 # CUBE_AGENT_EXT4 to pin runner-prestaged paths instead.
 #
+# Env worth knowing:
+#   CUBE_VM_BOOT_TIMEOUT_SECS  shim-side create/restore VsockServerReady wait
+#                              (default here: 600 for nested TCG; shim default 300)
+#
 # Flow mirrors the proven cube-l1 / cube-ali6000 testbed: stage assets ->
 # standalone containerd-cube -> `ctr run --runtime io.containerd.cube.rs` (boots
 # L2 via the shim + Cube-Hypervisor) -> assert VsockServerReady + task RUNNING ->
@@ -144,7 +148,15 @@ for d in cube-kernel-scf cube-image cube-agent; do
 done
 
 # --- 2) start a standalone containerd-cube (no systemd on the runner) -------
-info "start standalone containerd-cube"
+# Nested-TCG guests either boot in well under a minute (healthy) or stop making
+# ANY progress (observed twice: zero guest output for 291s and 900s -- a total
+# stall, not slow-forward). The timeout therefore only bounds the cost of a
+# hung attempt; 600s leaves headroom for a slow-but-alive boot on a loaded
+# 4-vCPU runner while keeping a hung attempt affordable for the retry loop.
+# containerd inherits this env and passes it to the containerd-shim-cube-rs
+# children it spawns.
+export CUBE_VM_BOOT_TIMEOUT_SECS="${CUBE_VM_BOOT_TIMEOUT_SECS:-600}"
+info "start standalone containerd-cube (CUBE_VM_BOOT_TIMEOUT_SECS=${CUBE_VM_BOOT_TIMEOUT_SECS})"
 if ! ctr --address "${SOCK}" version >/dev/null 2>&1; then
   containerd --address "${SOCK}" --root /var/lib/containerd-cube --state /run/containerd-cube-state \
     >/data/log/CubeVmm/containerd.log 2>&1 &

@@ -949,9 +949,16 @@ impl SandBox {
         {
             let ch = self.ch.as_mut().unwrap().lock().await;
             let start = Instant::now();
-            let ev = ch
-                .wait_notify(Duration::from_nanos(1000 * 1000 * 1000 * 300 as u64))
-                .await?;
+            // Nested/emulated (TCG) CI hosts intermittently stall the guest
+            // outright (observed: zero progress for 900s in a boot that
+            // otherwise takes ~20-60s), so CI may stretch this window via
+            // CUBE_VM_BOOT_TIMEOUT_SECS.
+            let boot_secs = std::env::var("CUBE_VM_BOOT_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(300);
+            let ev = ch.wait_notify(Duration::from_secs(boot_secs)).await?;
 
             if CH::NotifyEvent::VsockServerReady != ev {
                 return Err(format!(
@@ -961,7 +968,12 @@ impl SandBox {
                 ));
             }
             let duration = start.elapsed().as_millis();
-            infof!(self.log, "vm ready, vsock is listening, cost:{}", duration);
+            infof!(
+                self.log,
+                "vm ready, vsock is listening, cost:{} (timeout {}s)",
+                duration,
+                boot_secs
+            );
         }
         Ok(snapshot)
     }
