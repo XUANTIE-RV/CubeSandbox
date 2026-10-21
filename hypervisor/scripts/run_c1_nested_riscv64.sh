@@ -206,6 +206,7 @@ if [[ "${RUN_MODE}" == "control-plane" ]]; then
   info "staging control-plane payload into the 9p share"
   cp -f "${CONTROL_PLANE}" "${SHARE}/run_control_plane_riscv64.sh"
   chmod +x "${SHARE}/run_control_plane_riscv64.sh"
+  cp -f "${BIN_DIR}"/{cubemaster-riscv64,cubemastercli-riscv64,templatecenter-riscv64,cubeops-riscv64,cubelet-riscv64,cube-api-riscv64,cube-volume-s3-riscv64,cubevsmapdump-riscv64} "${SHARE}/"
   mkdir -p "${SHARE}/cpconf" "${SHARE}/cpassets"
   cp -f "${REPO}"/hypervisor/scripts/control-plane-riscv64/* "${SHARE}/cpconf/"
   cp -f "${REPO}/deploy/one-click/config-cube.toml" "${SHARE}/config-cube.toml"
