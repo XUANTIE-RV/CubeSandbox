@@ -136,6 +136,18 @@ cp -f "${INTEGRATION}" "${SHARE}/run_integration_tests_riscv64.sh"
 # vmlinux is the name the shim expects for cube-kernel-scf/vmlinux.
 cp -f "${WORKLOADS_DIR}/Image" "${SHARE}/vmlinux"
 
+# The Ubuntu cloudimg L1 ships no containerd; stage the official release
+# tarball (public, same fetch style as fetch_guest_assets_riscv64.sh). The
+# integration script starts `containerd --address ${SOCK}` itself inside the L1.
+CONTAINERD_VERSION="${CONTAINERD_VERSION:-1.7.20}"
+CONTAINERD_TAR="${WORKLOADS_DIR}/containerd-${CONTAINERD_VERSION}-linux-riscv64.tar.gz"
+if [[ ! -s "${CONTAINERD_TAR}" ]]; then
+  info "fetching containerd ${CONTAINERD_VERSION} (linux-riscv64, official release)"
+  curl -fSL --retry 3 -o "${CONTAINERD_TAR}" \
+    "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-riscv64.tar.gz"
+fi
+cp -f "${CONTAINERD_TAR}" "${SHARE}/"
+
 # --- boot the L1 (QEMU TCG, H-ext + AIA), host-forward ssh, 9p share ---------
 SERIAL="${RUNDIR}/serial.log"; PIDFILE="${RUNDIR}/qemu.pid"
 info "booting L1: ${QEMU} -cpu max -smp ${L1_SMP} -m ${L1_MEM} (TCG)"
@@ -176,6 +188,10 @@ ${SSH} 'sudo bash -c "
   export WORKLOADS_DIR=/mnt/share
   # stage the assets where run_integration_tests_riscv64.sh expects them
   cp -f /mnt/share/Image /mnt/share/vmlinux /mnt/share/fw_dynamic.bin /mnt/share/cube-*.img /mnt/share/cube-*.ext4 /mnt/share/cube-*.json /mnt/share/cube-min.tar /mnt/share/*-riscv64 /data/ 2>/dev/null || true
+  # provision containerd/ctr + register the cube shim (io.containerd.cube.rs ->
+  # containerd-shim-cube-rs per containerd shim naming)
+  tar -xzf /mnt/share/containerd-*.tar.gz -C /usr/local
+  install -m 0755 /data/containerd-shim-cube-rs-riscv64 /usr/local/bin/containerd-shim-cube-rs
   chmod +x /mnt/share/run_integration_tests_riscv64.sh
   # The integration script resolves REPO from its own path (/mnt/share), so its
   # default OUTPUT_BIN=/mnt/_output/bin never exists; the binaries live in /data.
