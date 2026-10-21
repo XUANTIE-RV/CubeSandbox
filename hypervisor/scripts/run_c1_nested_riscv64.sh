@@ -194,10 +194,10 @@ info "waiting for L1 ssh (TCG boot is slow)..."
 ready=0
 for _ in $(seq 1 120); do
   if ${SSH} 'echo up' >/dev/null 2>&1; then ready=1; break; fi
-  kill -0 "${QPID}" 2>/dev/null || die "L1 qemu exited during boot (see ${SERIAL})"
+  kill -0 "${QPID}" 2>/dev/null || { echo "=== full serial.log (L1 qemu exited) ==="; cat "${SERIAL}"; die "L1 qemu exited during boot"; }
   sleep 5
 done
-[[ "${ready}" -eq 1 ]] || die "L1 did not become ssh-reachable in time (see ${SERIAL})"
+[[ "${ready}" -eq 1 ]] || { echo "=== full serial.log (L1 ssh timeout) ==="; cat "${SERIAL}"; die "L1 did not become ssh-reachable in time"; }
 info "L1 up: $(${SSH} 'uname -r; nproc; test -e /dev/kvm && echo KVM_YES || echo KVM_NO' 2>/dev/null | tr '\n' ' ')"
 ${SSH} 'test -e /dev/kvm' || die "L1 has no /dev/kvm -- QEMU H-extension not exposed to the L1"
 
@@ -259,8 +259,9 @@ for attempt in $(seq 1 "${INTEGRATION_ATTEMPTS}"); do
   [[ "${rc}" -eq 0 ]] && break
 done
 
-echo "=== restore/corruption assertions ==="
-grep -iE 'RUNNING|snapshot success|arena already|segfault|corrupt|RESTORE_DONE' "${RUNDIR}/integration.log" || true
+echo "=== full integration.log ==="
+cat "${RUNDIR}/integration.log"
+echo "=== end integration.log ==="
 if grep -qiE 'arena already|internal error: segfault' "${RUNDIR}/integration.log"; then
   die "guest-memory corruption detected in the integration log"
 fi
