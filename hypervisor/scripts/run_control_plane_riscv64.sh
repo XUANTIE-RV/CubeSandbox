@@ -276,8 +276,14 @@ info "start cubelet (:9999)"
 # containerd (same mechanism as the integration lane): the template build's
 # verification sandbox boots an L2 on KVM-over-TCG and 300s was not enough
 # (run 39672874331: VsockServerReady never arrived, create timed out).
+# CUBE_GUEST_CONSOLE_DIR makes the shim write the L2 guest console to
+# per-sandbox files under /data/log/CubeVmm (picked up by dump_all_logs), and
+# CUBE_GUEST_DEBUG drops 'quiet' from the guest cmdline so the full kernel
+# boot is visible; both default off outside CI.
 CUBE_SANDBOX_NODE_IP="${CUBE_SANDBOX_NODE_IP}" \
   CUBE_VM_BOOT_TIMEOUT_SECS="${CUBE_VM_BOOT_TIMEOUT_SECS:-1200}" \
+  CUBE_GUEST_CONSOLE_DIR=/data/log/CubeVmm \
+  CUBE_GUEST_DEBUG=1 \
   nohup "${TB}/Cubelet/bin/cubelet" \
     --config "${TB}/Cubelet/config/config.toml" \
     --dynamic-conf-path "${TB}/Cubelet/dynamicconf/conf.yaml" \
