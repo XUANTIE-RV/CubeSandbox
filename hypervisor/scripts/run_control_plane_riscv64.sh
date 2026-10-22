@@ -272,7 +272,12 @@ CUBE_TEMPLATE_CENTER_CONFIG_PATH="${TB}/CubeTemplateCenter/conf.yaml" \
 wait_port 8090 templatecenter
 
 info "start cubelet (:9999)"
+# CUBE_VM_BOOT_TIMEOUT_SECS reaches the shim through cubelet's embedded
+# containerd (same mechanism as the integration lane): the template build's
+# verification sandbox boots an L2 on KVM-over-TCG and 300s was not enough
+# (run 39672874331: VsockServerReady never arrived, create timed out).
 CUBE_SANDBOX_NODE_IP="${CUBE_SANDBOX_NODE_IP}" \
+  CUBE_VM_BOOT_TIMEOUT_SECS="${CUBE_VM_BOOT_TIMEOUT_SECS:-1200}" \
   nohup "${TB}/Cubelet/bin/cubelet" \
     --config "${TB}/Cubelet/config/config.toml" \
     --dynamic-conf-path "${TB}/Cubelet/dynamicconf/conf.yaml" \

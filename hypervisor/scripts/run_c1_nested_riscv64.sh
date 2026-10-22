@@ -349,8 +349,15 @@ case "${RUN_MODE}" in
       done
       [[ -s /mnt/share/run_control_plane_riscv64.sh ]] || { echo \"FATAL: 9p share never populated\"; exit 1; }
       bash /mnt/share/run_control_plane_riscv64.sh < /dev/null
+      echo \$? > /mnt/share/control-plane.rc
+      sync
+      poweroff -f
     "' </dev/null 2>&1 | tee "${RUNDIR}/control-plane.log"
-    rc=${PIPESTATUS[0]}
+    # The L1 powers off when the in-L1 script finishes, which drops the ssh
+    # session (rc 255) regardless of lingering daemon fds -- the real in-L1
+    # exit code is plumbed through the 9p share. The timeout above stays as
+    # the backstop for an in-L1 wedge (poweroff never runs then).
+    rc=$(cat "${SHARE}/control-plane.rc" 2>/dev/null || echo 255)
     set -e
 
     echo "=== full control-plane.log ==="
