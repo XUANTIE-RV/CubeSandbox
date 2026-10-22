@@ -15,7 +15,9 @@ use containerd_shim::protos::events::task::TaskOOM;
 use containerd_shim::protos::protobuf::MessageDyn;
 use containerd_shim::{Error, Result};
 use cube_hypervisor::config::RestoreConfig;
-use cube_hypervisor::vm_config::{DeviceConfig, FsConfig, IvshmemConfig};
+use cube_hypervisor::vm_config::{
+    ConsoleConfig, ConsoleOutputMode, DeviceConfig, FsConfig, IvshmemConfig,
+};
 use cube_hypervisor::{SnapshotType, VmRemoveDeviceData};
 use oci_spec::runtime::{LinuxResources, Process, Spec};
 use protoc::{agent, agent_ttrpc, health, health_ttrpc};
@@ -815,7 +817,25 @@ impl SandBox {
             vc.set_memory(self.conf.vm_res.memory, true);
         }
 
-        if self.debug {
+        // CUBE_GUEST_CONSOLE_DIR redirects guest serial/virtio-console output
+        // to per-sandbox files; the default Tty target is the shim's stdout,
+        // which containerd discards, leaving guest-side boot hangs invisible.
+        let console_dir = std::env::var_os("CUBE_GUEST_CONSOLE_DIR").filter(|d| !d.is_empty());
+        if let Some(dir) = console_dir {
+            let dir = PathBuf::from(dir);
+            vc.serial = ConsoleConfig {
+                mode: ConsoleOutputMode::File,
+                file: Some(dir.join(format!("serial-{}.log", self.id))),
+                ..Default::default()
+            };
+            vc.console = ConsoleConfig {
+                mode: ConsoleOutputMode::File,
+                file: Some(dir.join(format!("console-{}.log", self.id))),
+                ..Default::default()
+            };
+        }
+
+        if self.debug || std::env::var_os("CUBE_GUEST_DEBUG").is_some() {
             vc.add_cmdline("agent.log=debug".to_string());
         } else {
             vc.add_cmdline("quiet".to_string());

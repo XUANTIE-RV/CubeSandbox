@@ -192,14 +192,8 @@ impl VmConfig {
         vc.fs = self.fss.clone();
         vc.pmem = self.pmems.clone();
 
-        let console = ConsoleConfig {
-            mode: ConsoleOutputMode::Tty,
-            ..Default::default()
-        };
-
-        //fixd in cube
-        vc.serial = console.clone();
-        vc.console = console;
+        vc.serial = self.serial.clone();
+        vc.console = self.console.clone();
         vc.sys_ctrl = true;
         if let Some(vs) = self.vsock.clone() {
             vc.vsock = Some(vs)
