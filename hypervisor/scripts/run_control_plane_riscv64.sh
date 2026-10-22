@@ -78,6 +78,11 @@ dump_all_logs() {
            /var/log/cube-api.log; do
     [[ -e "${f}" ]] && dump_full "${f}"
   done
+  # L1 kernel log: captures nested-KVM (gstage/dirty-ring/AIA) errors from
+  # the L2 VM's lifetime, which no control-plane log can see.
+  echo "=== L1 dmesg (full, unfiltered) ==="
+  dmesg 2>&1 || true
+  echo "=== end L1 dmesg ==="
 }
 
 FAILED=1
@@ -280,10 +285,15 @@ info "start cubelet (:9999)"
 # per-sandbox files under /data/log/CubeVmm (picked up by dump_all_logs), and
 # CUBE_GUEST_DEBUG drops 'quiet' from the guest cmdline so the full kernel
 # boot is visible; both default off outside CI.
+# CUBE_DISABLE_VM_DIRTY_LOG forces vc.memory.dirty_log=false: with dirty
+# logging on (template-verification VMs set app_snapshot_create), the L2
+# stalls outright under nested KVM on TCG (runs 39699478142/39709978005),
+# while the dirty_log=false integration lane boots the same guest reliably.
 CUBE_SANDBOX_NODE_IP="${CUBE_SANDBOX_NODE_IP}" \
   CUBE_VM_BOOT_TIMEOUT_SECS="${CUBE_VM_BOOT_TIMEOUT_SECS:-1200}" \
   CUBE_GUEST_CONSOLE_DIR=/data/log/CubeVmm \
   CUBE_GUEST_DEBUG=1 \
+  CUBE_DISABLE_VM_DIRTY_LOG=1 \
   nohup "${TB}/Cubelet/bin/cubelet" \
     --config "${TB}/Cubelet/config/config.toml" \
     --dynamic-conf-path "${TB}/Cubelet/dynamicconf/conf.yaml" \
