@@ -814,7 +814,13 @@ impl SandBox {
             vc.add_fs(fs);
         }
         if self.conf.app_snapshot_create {
-            vc.set_memory(self.conf.vm_res.memory, true);
+            // CUBE_DISABLE_VM_DIRTY_LOG: CI escape hatch. KVM dirty logging
+            // for the L2 guest runs on the L1 kernel, and under nested KVM on
+            // TCG it has repeatedly stalled the L2 outright (control-plane
+            // lane runs 39699478142/39709978005); the integration lane, which
+            // does not set dirty_log, boots the same guest reliably.
+            let dirty_log = std::env::var_os("CUBE_DISABLE_VM_DIRTY_LOG").is_none();
+            vc.set_memory(self.conf.vm_res.memory, dirty_log);
         }
 
         // CUBE_GUEST_CONSOLE_DIR redirects guest serial/virtio-console output
