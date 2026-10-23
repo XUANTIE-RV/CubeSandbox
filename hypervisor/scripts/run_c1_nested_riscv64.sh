@@ -217,10 +217,17 @@ fi
 # --- boot the L1 (QEMU TCG, H-ext + AIA), host-forward ssh, 9p share ---------
 SERIAL="${RUNDIR}/serial.log"; PIDFILE="${RUNDIR}/qemu.pid"
 info "booting L1: ${QEMU} -cpu max -smp ${L1_SMP} -m ${L1_MEM} (TCG)"
+# preempt=none: the nested-TCG L2 boot wedge rate is highly sensitive to the
+# L1 kernel's preemption model (measured on 232 bootloop: PREEMPT_LAZY+HZ250
+# L1 ~50% wedge, preempt=none+HZ100 L1 ~5%). The 7.2 guest kernel config now
+# ships CONFIG_PREEMPT_DYNAMIC=y so the L1 can select the none model here;
+# this only affects the L1 host, the L2 guest keeps its own defaults.
+# NOTE: this comment must stay OUTSIDE the qemu line-continuation chain --
+# a comment line inside a `\`-continued command terminates the command early.
 "${QEMU}" \
   -M virt,aia=aplic-imsic,aia-guests=4 -cpu max -smp "${L1_SMP}" -m "${L1_MEM}" \
   -bios "${WORKLOADS_DIR}/fw_dynamic.bin" -kernel "${WORKLOADS_DIR}/Image" \
-  -append "root=/dev/vda1 rw rootwait console=ttyS0 earlycon=sbi" \
+  -append "root=/dev/vda1 rw rootwait console=ttyS0 earlycon=sbi preempt=none" \
   -drive "file=${ROOT_OVL},format=qcow2,if=virtio" \
   -drive "file=${DATA_DISK},format=raw,if=virtio" \
   -drive "file=${RUNDIR}/cidata.img,format=raw,if=virtio,readonly=on" \
