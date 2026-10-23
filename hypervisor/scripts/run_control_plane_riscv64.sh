@@ -83,9 +83,16 @@ trace_kvm_stop_dump() {
 # then attaches while the vcpus are still wedged) and snapshots the kvm trace.
 wedge_watch() {
   [[ "${TRACE_KVM}" == "1" ]] || return 0
-  local pid="" i t c
+  local pid="" p i t c
+  # Must match the CUBE shim (containerd-shim-cube-rs), not any runc shim
+  # (registry/coredns containers also have containerd-shim processes and would
+  # be picked first by a bare pgrep, silently disabling the detector).
   for i in $(seq 1 180); do
-    pid=$(pgrep -f 'containerd-shim' 2>/dev/null | head -1 || true)
+    for p in $(pgrep -f 'containerd-shim-cube' 2>/dev/null); do
+      if ls /proc/"${p}"/task/[0-9]*/comm 2>/dev/null | xargs -r grep -l '^vcpu' 2>/dev/null | head -1 | grep -q .; then
+        pid="${p}"; break
+      fi
+    done
     [[ -n "${pid}" ]] && break
     sleep 5
   done
@@ -112,9 +119,11 @@ wedge_watch() {
       # identical snapshots = every vcpu thread at zero jiffies delta for 30s
       if [[ "${a}" == "${b}" ]]; then
         info "WEDGE DETECTED: all vcpu threads of shim ${pid} idle for 30s, no VsockServerReady"
+        # Marker FIRST: the outer runner's gdbstub dump must attach while the
+        # wedged vCPUs still exist (it takes ~60s to walk vm_list).
+        touch "${SHARE}/.l1-wedged" 2>/dev/null || true
         echo "=== EARLY wedge forensics (VM still alive) ==="
         dump_wedge_forensics
-        touch "${SHARE}/.l1-wedged" 2>/dev/null || true
         trace_kvm_stop_dump
         echo "=== end EARLY wedge forensics ==="
         return 0
