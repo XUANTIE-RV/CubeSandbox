@@ -177,6 +177,39 @@ dump_wedge_forensics() {
   cat "${snap_a}.irq" || true
   echo "=== wedge forensics: /proc/interrupts t1 (5s later) ==="
   cat /proc/interrupts || true
+  # fd-level forensics: decide WHICH wakeup path lost the event. The 7.2
+  # wedge signature is both vCPUs parked in kvm_vcpu_block with
+  # irqs_pending=0 (virtual interrupt never injected) while every VMM
+  # device thread sleeps in epoll/io_wq, so the lost event is in the
+  # guest-kick -> VMM -> KVM-inject chain. fdinfo discriminates:
+  #   eventfd-count > 0 with its poller thread asleep = event fired but
+  #     the epoll wakeup was lost (eventpoll regression);
+  #   eventfd-count == 0 = the producer never fired (io_uring completion
+  #     or tap RX path regression).
+  # epoll fdinfo tfd lines show per-monitored-fd revents: nonzero revents
+  # while epoll_wait sleeps = ready event stuck in the epoll ready list.
+  local shim_pid="" f lnk
+  for p in $(pgrep -f 'containerd-shim-cube' 2>/dev/null); do
+    if ls /proc/"${p}"/task/[0-9]*/comm 2>/dev/null | xargs -r grep -l '^vcpu' 2>/dev/null | head -1 | grep -q .; then
+      shim_pid="${p}"; break
+    fi
+  done
+  if [[ -n "${shim_pid}" ]]; then
+    echo "=== wedge forensics: shim ${shim_pid} fd table ==="
+    ls -l /proc/"${shim_pid}"/fd 2>/dev/null || true
+    echo "=== wedge forensics: shim ${shim_pid} fdinfo (eventfd/epoll/io_uring/kvm) ==="
+    for f in /proc/"${shim_pid}"/fd/[0-9]*; do
+      lnk=$(readlink "${f}" 2>/dev/null) || continue
+      case "${lnk}" in
+        anon_inode:\[eventfd\]|anon_inode:\[eventpoll\]|anon_inode:\[io_uring\]|anon_inode:kvm-*|/dev/kvm|/dev/net/tun|socket:*)
+          echo "--- fd ${f##*/} -> ${lnk} ---"
+          cat /proc/"${shim_pid}"/fdinfo/"${f##*/}" 2>/dev/null || true
+          ;;
+      esac
+    done
+  else
+    echo "(no cube shim with vcpu threads alive; fd forensics skipped)"
+  fi
   echo "=== wedge forensics: kernel stacks of non-running cube threads ==="
   for p in ${procs}; do
     for t in /proc/${p}/task/[0-9]*; do
