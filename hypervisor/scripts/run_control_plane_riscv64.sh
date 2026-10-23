@@ -47,6 +47,53 @@ dump_full() { local f="$1"
   if [[ -s "${f}" ]]; then cat "${f}"; else echo "(missing or empty: ${f})"; fi
   echo "=== end ${f} ===" ; }
 
+# Nested-TCG wedge forensics (root-causing the 7.2 L1-kernel L2 boot wedge).
+# On PASS this is the baseline; on FAIL it shows whether the L2 vCPU threads
+# are sleeping in the L1 kernel (lost wakeup / lost virtual interrupt) or
+# spinning (guest busy loop, e.g. starved timer). Sampling window is 5s.
+dump_wedge_forensics() {
+  echo "=== wedge forensics: uptime / loadavg ==="
+  uptime || true
+  echo "=== wedge forensics: cube-related threads (state + wchan) ==="
+  ps -eLo pid,tid,stat,wchan:40,etime,comm 2>/dev/null | awk 'NR==1 || /[Cc]ube|vcpu|shim/' || true
+  local procs snap_a snap_b p t
+  procs=$(pgrep -f 'cube|containerd-shim' 2>/dev/null || true)
+  if [[ -z "${procs}" ]]; then echo "(no cube processes alive)"; return; fi
+  snap_a=$(mktemp); snap_b=$(mktemp)
+  for p in ${procs}; do
+    for t in /proc/${p}/task/[0-9]*; do
+      awk '{print "'"${p}/${t##*/}"'", $3, $2, $14+$15}' "${t}/stat" 2>/dev/null
+    done
+  done > "${snap_a}"
+  cp /proc/interrupts "${snap_a}.irq"
+  sleep 5
+  for p in ${procs}; do
+    for t in /proc/${p}/task/[0-9]*; do
+      awk '{print "'"${p}/${t##*/}"'", $3, $2, $14+$15}' "${t}/stat" 2>/dev/null
+    done
+  done > "${snap_b}"
+  echo "=== wedge forensics: per-thread jiffies(utime+stime) delta over 5s ==="
+  echo "(pid/tid state@t1 comm delta; delta>0 = burning CPU, delta=0 = sleeping)"
+  join -j 1 <(sort "${snap_a}") <(sort "${snap_b}") 2>/dev/null \
+    | awk '{printf "%-14s %-4s %-28s %d\n", $1, $5, $6, $7-$4}' \
+    | sort -k4 -nr || true
+  echo "=== wedge forensics: /proc/interrupts t0 ==="
+  cat "${snap_a}.irq" || true
+  echo "=== wedge forensics: /proc/interrupts t1 (5s later) ==="
+  cat /proc/interrupts || true
+  echo "=== wedge forensics: kernel stacks of non-running cube threads ==="
+  for p in ${procs}; do
+    for t in /proc/${p}/task/[0-9]*; do
+      local st
+      st=$(awk '{print $3}' "${t}/stat" 2>/dev/null) || continue
+      [[ "${st}" == "R" ]] && continue
+      echo "--- ${p}/${t##*/} state=${st} comm=$(cat "${t}/comm" 2>/dev/null) ---"
+      cat "${t}/stack" 2>/dev/null || echo "(kernel stack unavailable)"
+    done
+  done
+  rm -f "${snap_a}" "${snap_b}" "${snap_a}.irq"
+}
+
 # The cube network data plane (cube-dev bridge + tap devices + cubevs eBPF
 # maps) is part of what this phase validates -- dump it in full, unfiltered.
 dump_net_state() { local label="$1"
@@ -88,10 +135,21 @@ dump_all_logs() {
 FAILED=1
 on_exit() {
   echo "=== [cp] final state: $([[ ${FAILED} -eq 0 ]] && echo PASS || echo FAIL) ==="
+  # Marker for the outer runner's gdbstub watcher: on failure, hold the L1 up
+  # (below) so the host can attach to the still-wedged L2 before poweroff.
+  [[ ${FAILED} -eq 0 ]] || { touch "${SHARE}/.l1-wedged" 2>/dev/null || true; }
   echo "=== listening sockets (full, unfiltered) ==="
   ss -ltnp 2>/dev/null || true
   dump_net_state "at exit" 2>/dev/null || true
+  dump_wedge_forensics
   dump_all_logs
+  if [[ ${FAILED} -ne 0 && -e "${SHARE}/.hold-l1-on-fail" ]]; then
+    info "FAIL: holding the L1 up for outer gdbstub forensics (max 15 min)"
+    for _ in $(seq 1 180); do
+      [[ -e "${SHARE}/.hold-l1-release" ]] && break
+      sleep 5
+    done
+  fi
 }
 trap on_exit EXIT
 

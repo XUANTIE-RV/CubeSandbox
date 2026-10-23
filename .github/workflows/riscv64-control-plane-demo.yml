@@ -118,15 +118,30 @@ jobs:
         if: vars.RISCV64_BUILD_KERNEL == '1'
         uses: actions/cache@v4
         with:
-          path: ${{ env.WORKLOADS_DIR }}/Image
+          # The vmlinux is cached alongside the Image so that L1_GDBSTUB=1
+          # wedge-debug runs have L1 kernel symbols even on a cache hit.
+          path: |
+            ${{ env.WORKLOADS_DIR }}/Image
+            ${{ runner.temp }}/kernel-build/build/vmlinux
           key: kernel-7.2-riscv64-v1-${{ hashFiles('configs/kernel-oc9.riscv64.config', 'configs/patches/riscv64-dax-zeropage-folio.patch', 'configs/patches/riscv64-kvm-zeropage-dirtylog.patch', 'scripts/build-kernel.sh', 'hypervisor/scripts/build_guest_kernel_riscv64.sh') }}
 
       - name: Build 7.2 guest kernel Image (in-place, cross-compiled)
         if: vars.RISCV64_BUILD_KERNEL == '1' && steps.cache-kernel.outputs.cache-hit != 'true'
+        env:
+          # Fixed WORK_DIR (instead of the script's mktemp default) so the built
+          # vmlinux lands at a known path for the gdbstub wedge-debug step.
+          WORK_DIR: ${{ runner.temp }}/kernel-build
         run: |
           set -euo pipefail
           chmod +x hypervisor/scripts/build_guest_kernel_riscv64.sh
           hypervisor/scripts/build_guest_kernel_riscv64.sh
+
+      - name: Install gdb-multiarch (gdbstub wedge forensics)
+        if: vars.RISCV64_L1_GDBSTUB == '1'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gdb-multiarch
 
       - name: Cache riscv64 guest assets (opensbi fw + Ubuntu rootfs raw)
         uses: actions/cache@v4
@@ -194,6 +209,11 @@ jobs:
           # 6G: the control plane (mysqld + redis + 5 Go services) shares the L1
           # with the L2 microVMs; the manual bed used a 6G L1 for the same chain.
           L1_MEM: ${{ vars.RISCV64_L1_CP_MEM || '6G' }}
+          # Wedge-debug knobs (7.2 L1 root-cause): RISCV64_L1_GDBSTUB=1 boots the
+          # L0 QEMU with a gdbstub and dumps the wedged L1 vCPU state on failure;
+          # RISCV64_L1_PREEMPT=lazy raises the ~5% wedge rate to ~50%.
+          L1_GDBSTUB: ${{ vars.RISCV64_L1_GDBSTUB || '0' }}
+          L1_PREEMPT: ${{ vars.RISCV64_L1_PREEMPT || 'none' }}
           RUNDIR: ${{ runner.temp }}/c1-l1
           QEMU: ${{ env.WORKLOADS_DIR }}/qemu-install/bin/qemu-system-riscv64
           RUN_MODE: control-plane
@@ -212,5 +232,6 @@ jobs:
             ${{ runner.temp }}/c1-l1/serial.log
             ${{ runner.temp }}/c1-l1/control-plane.log
             ${{ runner.temp }}/c1-l1/qemu-guest-errors.log
+            ${{ runner.temp }}/c1-l1/gdbstub-forensics.log
           if-no-files-found: ignore
           retention-days: 7

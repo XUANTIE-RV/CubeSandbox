@@ -29,6 +29,19 @@
 #   L1_MEM          L1 memory (default 4G)
 #   QEMU            qemu-system-riscv64 (default: from PATH)
 #   L1_PORT         host ssh port forwarded to L1:22 (default 22699)
+#   L1_PREEMPT      L1 kernel runtime preemption model (default none; the config
+#                   has CONFIG_PREEMPT_DYNAMIC=y, so none|voluntary|full|lazy all
+#                   work). The nested-TCG L2 wedge rate is strongly dependent on
+#                   this (lazy ~50%, none ~5%); use lazy for wedge-debug runs.
+#   L1_GDBSTUB      1 = launch the L0 QEMU with a gdbstub on 127.0.0.1:L1_GDB_PORT
+#                   and, on in-L1 failure, hold the L1 up and dump per-vCPU
+#                   state (info threads / registers / backtraces) before
+#                   poweroff (default 0). Needs gdb-multiarch on the host; if
+#                   L1_VMLINUX points at the L1 kernel's vmlinux (debug_info),
+#                   backtraces resolve against L1 kernel symbols.
+#   L1_GDB_PORT     gdbstub TCP port (default 12999)
+#   L1_VMLINUX      optional path to the L1 kernel vmlinux for gdb symbols
+#                   (auto-discovered from a fixed WORK_DIR kernel build)
 #   RUNDIR          scratch dir for the L1 disks/serial/pid (default a mktemp -d)
 #   RUN_MODE        integration (default): run the shim-level snapshot/restore
 #                   smoke inside the L1 (run_integration_tests_riscv64.sh);
@@ -51,6 +64,9 @@ L1_SMP="${L1_SMP:-4}"
 L1_MEM="${L1_MEM:-4G}"
 QEMU="${QEMU:-qemu-system-riscv64}"
 L1_PORT="${L1_PORT:-22699}"
+L1_PREEMPT="${L1_PREEMPT:-none}"
+L1_GDBSTUB="${L1_GDBSTUB:-0}"
+L1_GDB_PORT="${L1_GDB_PORT:-12999}"
 RUNDIR="${RUNDIR:-$(mktemp -d /tmp/c1-l1.XXXXXX)}"
 INTEGRATION="${INTEGRATION:-$(dirname "$0")/run_integration_tests_riscv64.sh}"
 RUN_MODE="${RUN_MODE:-integration}"
@@ -60,6 +76,45 @@ CP_ASSETS_DIR="${CP_ASSETS_DIR:-${WORKLOADS_DIR}/control-plane}"
 
 info() { echo "[c1] $*"; }
 die()  { echo "[c1] ERROR: $*" >&2; exit 2; }
+
+# Attach to the L0 QEMU gdbstub and dump the full per-vCPU state of the
+# (still running, wedged) L1: thread list, backtraces (symbolized when
+# L1_VMLINUX is available) and registers. This is the L0-side complement of
+# the in-L1 wedge forensics: it shows WHERE each L1 vCPU is stuck (L1 kernel
+# sleep vs. executing L2 guest code).
+dump_gdbstub_forensics() {
+  local log="${RUNDIR}/gdbstub-forensics.log"
+  local gdb vmlinux c
+  gdb=$(command -v gdb-multiarch 2>/dev/null || command -v gdb 2>/dev/null || true)
+  if [[ -z "${gdb}" ]]; then
+    echo "no gdb/gdb-multiarch on the host; gdbstub forensics skipped" >"${log}"
+    return
+  fi
+  vmlinux="${L1_VMLINUX:-}"
+  if [[ -z "${vmlinux}" ]]; then
+    for c in "${RUNDIR}/../kernel-build/build/vmlinux"; do
+      [[ -s "${c}" ]] && { vmlinux="${c}"; break; }
+    done
+  fi
+  info "gdbstub forensics: gdb=${gdb} vmlinux=${vmlinux:-none} -> ${log}"
+  {
+    echo "=== gdbstub forensics ($(date -u +%FT%TZ)) ==="
+    echo "gdb: ${gdb}"
+    echo "vmlinux: ${vmlinux:-<none, registers will be raw>}"
+    "${gdb}" -nx -batch \
+      ${vmlinux:+"${vmlinux}"} \
+      -ex "set pagination off" \
+      -ex "set architecture riscv:rv64" \
+      -ex "target remote 127.0.0.1:${L1_GDB_PORT}" \
+      -ex "monitor info status" \
+      -ex "monitor info cpus" \
+      -ex "info threads" \
+      -ex "thread apply all bt" \
+      -ex "thread apply all info registers" \
+      -ex "detach" 2>&1
+    echo "=== end gdbstub forensics ==="
+  } >"${log}" 2>&1
+}
 
 command -v "${QEMU}" >/dev/null 2>&1 || die "qemu-system-riscv64 not found (set QEMU=)"
 command -v qemu-img >/dev/null 2>&1 || die "qemu-img not found"
@@ -240,18 +295,22 @@ fi
 
 # --- boot the L1 (QEMU TCG, H-ext + AIA), host-forward ssh, 9p share ---------
 SERIAL="${RUNDIR}/serial.log"; PIDFILE="${RUNDIR}/qemu.pid"
-info "booting L1: ${QEMU} -cpu max -smp ${L1_SMP} -m ${L1_MEM} (TCG)"
-# preempt=none: the nested-TCG L2 boot wedge rate is highly sensitive to the
-# L1 kernel's preemption model (measured on 232 bootloop: PREEMPT_LAZY+HZ250
-# L1 ~50% wedge, preempt=none+HZ100 L1 ~5%). The 7.2 guest kernel config now
-# ships CONFIG_PREEMPT_DYNAMIC=y so the L1 can select the none model here;
-# this only affects the L1 host, the L2 guest keeps its own defaults.
+info "booting L1: ${QEMU} -cpu max -smp ${L1_SMP} -m ${L1_MEM} (TCG, preempt=${L1_PREEMPT}, gdbstub=${L1_GDBSTUB})"
+GDB_ARGS=()
+if [[ "${L1_GDBSTUB}" == "1" ]]; then
+  GDB_ARGS=(-gdb "tcp:127.0.0.1:${L1_GDB_PORT}")
+fi
+# preempt=${L1_PREEMPT}: the nested-TCG L2 boot wedge rate is highly sensitive
+# to the L1 kernel's preemption model (measured on 232 bootloop: PREEMPT_LAZY
+# L1 ~50% wedge, preempt=none+HZ100 L1 ~5%). The 7.2 guest kernel config ships
+# CONFIG_PREEMPT_DYNAMIC=y so the L1 selects the model at boot; this only
+# affects the L1 host, the L2 guest keeps its own defaults.
 # NOTE: this comment must stay OUTSIDE the qemu line-continuation chain --
 # a comment line inside a `\`-continued command terminates the command early.
 "${QEMU}" \
   -M virt,aia=aplic-imsic,aia-guests=4 -cpu max -smp "${L1_SMP}" -m "${L1_MEM}" \
   -bios "${WORKLOADS_DIR}/fw_dynamic.bin" -kernel "${WORKLOADS_DIR}/Image" \
-  -append "root=/dev/vda1 rw rootwait console=ttyS0 earlycon=sbi preempt=none" \
+  -append "root=/dev/vda1 rw rootwait console=ttyS0 earlycon=sbi preempt=${L1_PREEMPT}" \
   -drive "file=${ROOT_OVL},format=qcow2,if=virtio" \
   -drive "file=${DATA_DISK},format=raw,if=virtio" \
   -drive "file=${RUNDIR}/cidata.img,format=raw,if=virtio,readonly=on" \
@@ -260,6 +319,7 @@ info "booting L1: ${QEMU} -cpu max -smp ${L1_SMP} -m ${L1_MEM} (TCG)"
   -virtfs "local,path=${SHARE},mount_tag=c1share,security_model=none,id=c1share" \
   -chardev "socket,id=ser0,path=${RUNDIR}/serial.sock,server=on,wait=off,logfile=${SERIAL},logappend=off" \
   -serial chardev:ser0 -monitor none -display none -pidfile "${PIDFILE}" \
+  "${GDB_ARGS[@]}" \
   -d guest_errors -D "${RUNDIR}/qemu-guest-errors.log" &
 QPID=$!
 trap 'kill "${QPID}" 2>/dev/null || true' EXIT
@@ -362,6 +422,27 @@ case "${RUN_MODE}" in
     # a failed job whose full logs are dumped by the in-L1 script's EXIT trap.
     info "running the control-plane demo inside the L1 (RUN_MODE=control-plane)"
     set +e
+    # gdbstub wedge watcher: when enabled, the in-L1 script touches
+    # /mnt/share/.l1-wedged at the start of its failure path and then holds the
+    # L1 up (instead of an immediate poweroff) waiting for .hold-l1-release.
+    # This watcher races that window: attach to the L0 QEMU gdbstub, dump the
+    # per-vCPU state of the wedged L1, then release the L1 to power off.
+    WATCHER=""
+    if [[ "${L1_GDBSTUB}" == "1" ]]; then
+      rm -f "${SHARE}/.l1-wedged" "${SHARE}/.hold-l1-release"
+      touch "${SHARE}/.hold-l1-on-fail"
+      ( for _ in $(seq 1 2100); do
+          if [[ -e "${SHARE}/.l1-wedged" ]]; then
+            sleep 10
+            dump_gdbstub_forensics
+            touch "${SHARE}/.hold-l1-release"
+            exit 0
+          fi
+          kill -0 "${QPID}" 2>/dev/null || exit 0
+          sleep 5
+        done ) &
+      WATCHER=$!
+    fi
     # timeout: bound any L1-side wedge well under the 330-min job cap; the
     # scripted internal budgets (bring-up ~30m + template poll 90m + demo 15m
     # + dumps) sum to ~2.5h. stdin is detached both here and per-daemon in the
@@ -390,6 +471,13 @@ case "${RUN_MODE}" in
     # the backstop for an in-L1 wedge (poweroff never runs then).
     rc=$(cat "${SHARE}/control-plane.rc" 2>/dev/null || echo 255)
     set -e
+    [[ -z "${WATCHER}" ]] || { kill "${WATCHER}" 2>/dev/null || true; wait "${WATCHER}" 2>/dev/null || true; }
+    rm -f "${SHARE}/.hold-l1-on-fail" "${SHARE}/.hold-l1-release" "${SHARE}/.l1-wedged"
+    if [[ -s "${RUNDIR}/gdbstub-forensics.log" ]]; then
+      echo "=== gdbstub forensics (full, unfiltered) ==="
+      cat "${RUNDIR}/gdbstub-forensics.log"
+      echo "=== end gdbstub forensics ==="
+    fi
 
     if [[ "${rc}" -eq 77 && -n "${SAVE_GOLDEN_QCOW2:-}" ]]; then
       cp --reflink=auto "${ROOT_OVL}" "${SAVE_GOLDEN_QCOW2}"
