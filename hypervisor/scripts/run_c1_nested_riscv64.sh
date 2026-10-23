@@ -95,8 +95,15 @@ dump_gdbstub_forensics() {
   fi
   vmlinux="${L1_VMLINUX:-}"
   if [[ -z "${vmlinux}" ]]; then
-    for c in "${RUNDIR}/../kernel-build/build/vmlinux"; do
-      [[ -s "${c}" ]] && { vmlinux="${c}"; break; }
+    # NOTE: scripts/build-kernel.sh normalizes the riscv64 PE Image over the
+    # real ELF vmlinux (deploy name), preserving the ELF as vmlinux.elf. Only
+    # an ELF carries symbol/debug info usable by gdb -- never pass the PE.
+    for c in "${RUNDIR}/../kernel-build/build/vmlinux.elf" "${RUNDIR}/../kernel-build/build/vmlinux"; do
+      [[ -s "${c}" ]] || continue
+      if [[ "$(head -c4 "${c}" | od -An -tx1 | tr -d ' \n')" == "7f454c46" ]]; then
+        vmlinux="${c}"; break
+      fi
+      info "WARN: ${c} is not an ELF (PE Image?); not usable for gdb symbols"
     done
   fi
   info "gdbstub forensics: gdb=${gdb} vmlinux=${vmlinux:-none} -> ${log}"
@@ -538,7 +545,7 @@ case "${RUN_MODE}" in
         sleep 3
       done
       [[ -s /mnt/share/run_control_plane_riscv64.sh ]] || { echo \"FATAL: 9p share never populated\"; exit 1; }
-      TRACE_KVM=${L1_TRACE_KVM} bash /mnt/share/run_control_plane_riscv64.sh < /dev/null
+      TRACE_KVM='"${L1_TRACE_KVM}"' bash /mnt/share/run_control_plane_riscv64.sh < /dev/null
       echo \$? > /mnt/share/control-plane.rc
       sync
       poweroff -f

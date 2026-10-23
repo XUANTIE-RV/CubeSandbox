@@ -73,10 +73,15 @@ make -C "${KERNEL_SRC_DIR}" O="${KERNEL_OUTPUT_DIR}" \
 [ -f "${KERNEL_OUTPUT_DIR}/vmlinux" ] || err "build did not produce ${KERNEL_OUTPUT_DIR}/vmlinux"
 
 # Normalize raw Image targets to the deploy scripts' vmlinux output name.
+# Keep the real ELF vmlinux as vmlinux.elf first: it carries the symbol and
+# debug info needed by gdb (the PE Image has neither).
 case "${KERNEL_TARGET_ARCH}" in
   aarch64) image_path="${KERNEL_OUTPUT_DIR}/arch/arm64/boot/Image" ;;
   riscv64) image_path="${KERNEL_OUTPUT_DIR}/arch/riscv/boot/Image" ;;
   *) image_path= ;;
 esac
-[ -z "${image_path}" ] || { [ -f "${image_path}" ] && cp "${image_path}" "${KERNEL_OUTPUT_DIR}/vmlinux"; }
+if [ -n "${image_path}" ] && [ -f "${image_path}" ]; then
+  cp "${KERNEL_OUTPUT_DIR}/vmlinux" "${KERNEL_OUTPUT_DIR}/vmlinux.elf"
+  cp "${image_path}" "${KERNEL_OUTPUT_DIR}/vmlinux"
+fi
 echo "[kernel] done: ${KERNEL_OUTPUT_DIR}/vmlinux"

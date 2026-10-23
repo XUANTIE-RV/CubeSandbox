@@ -74,6 +74,58 @@ trace_kvm_stop_dump() {
   echo "=== end kvm trace ==="
 }
 
+# Early wedge detector (debug runs only, i.e. TRACE_KVM=1). The 1200s
+# CUBE_VM_BOOT_TIMEOUT teardown destroys the wedged VM before on_exit
+# forensics run, so this watcher samples the template VM's vCPU threads while
+# the VM is STILL alive: wedge = VM up > 240s, no VsockServerReady in the shim
+# log, and every vcpu thread at zero jiffies delta over 30s. On detection it
+# touches ${SHARE}/.l1-wedged immediately (the outer runner's gdbstub watcher
+# then attaches while the vcpus are still wedged) and snapshots the kvm trace.
+wedge_watch() {
+  [[ "${TRACE_KVM}" == "1" ]] || return 0
+  local pid="" i t c
+  for i in $(seq 1 180); do
+    pid=$(pgrep -f 'containerd-shim' 2>/dev/null | head -1 || true)
+    [[ -n "${pid}" ]] && break
+    sleep 5
+  done
+  [[ -n "${pid}" ]] || return 0
+  info "wedge_watch: shim pid=${pid}; grace 240s before sampling"
+  sleep 240
+  for i in $(seq 1 40); do
+    kill -0 "${pid}" 2>/dev/null || return 0
+    if grep -rqs 'VsockServerReady' /data/log/CubeShim 2>/dev/null; then
+      info "wedge_watch: VsockServerReady seen; VM healthy, watcher exiting"
+      return 0
+    fi
+    local a b
+    a=$(for t in /proc/"${pid}"/task/[0-9]*; do
+          c=$(cat "${t}/comm" 2>/dev/null) || continue
+          case "${c}" in *vcpu*) awk '{print $1, $14+$15}' "${t}/stat" 2>/dev/null;; esac
+        done)
+    if [[ -n "${a}" ]]; then
+      sleep 30
+      b=$(for t in /proc/"${pid}"/task/[0-9]*; do
+            c=$(cat "${t}/comm" 2>/dev/null) || continue
+            case "${c}" in *vcpu*) awk '{print $1, $14+$15}' "${t}/stat" 2>/dev/null;; esac
+          done)
+      # identical snapshots = every vcpu thread at zero jiffies delta for 30s
+      if [[ "${a}" == "${b}" ]]; then
+        info "WEDGE DETECTED: all vcpu threads of shim ${pid} idle for 30s, no VsockServerReady"
+        echo "=== EARLY wedge forensics (VM still alive) ==="
+        dump_wedge_forensics
+        touch "${SHARE}/.l1-wedged" 2>/dev/null || true
+        trace_kvm_stop_dump
+        echo "=== end EARLY wedge forensics ==="
+        return 0
+      fi
+    else
+      sleep 30
+    fi
+  done
+}
+WEDGE_WATCH_PID=""
+
 info() { echo "[cp] $(date +%H:%M:%S) $*"; }
 die()  { echo "[cp] ERROR: $*" >&2; exit 2; }
 
@@ -173,6 +225,7 @@ on_exit() {
   # Marker for the outer runner's gdbstub watcher: on failure, hold the L1 up
   # (below) so the host can attach to the still-wedged L2 before poweroff.
   [[ ${FAILED} -eq 0 ]] || { touch "${SHARE}/.l1-wedged" 2>/dev/null || true; }
+  [[ -z "${WEDGE_WATCH_PID}" ]] || { kill "${WEDGE_WATCH_PID}" 2>/dev/null || true; wait "${WEDGE_WATCH_PID}" 2>/dev/null || true; }
   # Stop + dump the kvm trace FIRST: its tail is the freshest wedge pre-history
   # and must be captured before the (slow) log dumps below run more guests I/O.
   trace_kvm_stop_dump
@@ -516,6 +569,7 @@ CMD='/usr/local/bin/envd -port 49983 -isnotfc >/var/log/envd.log 2>&1 & CODE_INT
 # TRACE_KVM=1: start kvm_entry/kvm_exit capture here so the ring buffer covers
 # the whole template VM boot window (where the 7.2 wedge happens).
 trace_kvm_start
+wedge_watch & WEDGE_WATCH_PID=$!
 info "tpl create-from-image (probe 49999 /health, timeout 300s)"
 CM="${TB}/CubeMaster/bin/cubemastercli"
 "${CM}" --address 127.0.0.1 --port 8089 tpl create-from-image \

@@ -118,12 +118,15 @@ jobs:
         if: vars.RISCV64_BUILD_KERNEL == '1'
         uses: actions/cache@v4
         with:
-          # The vmlinux is cached alongside the Image so that L1_GDBSTUB=1
-          # wedge-debug runs have L1 kernel symbols even on a cache hit.
+          # The vmlinux.elf (real ELF with DWARF; build-kernel.sh normalizes
+          # the PE Image over the vmlinux name) is cached alongside the Image
+          # so that L1_GDBSTUB=1 wedge-debug runs have L1 kernel symbols even
+          # on a cache hit.
           path: |
             ${{ env.WORKLOADS_DIR }}/Image
             ${{ runner.temp }}/kernel-build/build/vmlinux
-          key: kernel-7.2-riscv64-v2-${{ hashFiles('configs/kernel-oc9.riscv64.config', 'configs/patches/riscv64-dax-zeropage-folio.patch', 'configs/patches/riscv64-kvm-zeropage-dirtylog.patch', 'scripts/build-kernel.sh', 'hypervisor/scripts/build_guest_kernel_riscv64.sh') }}
+            ${{ runner.temp }}/kernel-build/build/vmlinux.elf
+          key: kernel-7.2-riscv64-v3-${{ hashFiles('configs/kernel-oc9.riscv64.config', 'configs/patches/riscv64-dax-zeropage-folio.patch', 'configs/patches/riscv64-kvm-zeropage-dirtylog.patch', 'scripts/build-kernel.sh', 'hypervisor/scripts/build_guest_kernel_riscv64.sh') }}
 
       - name: Build 7.2 guest kernel Image (in-place, cross-compiled)
         if: vars.RISCV64_BUILD_KERNEL == '1' && steps.cache-kernel.outputs.cache-hit != 'true'
