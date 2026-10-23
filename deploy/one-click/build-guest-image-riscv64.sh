@@ -148,6 +148,11 @@ fi
 
 printf 'localhost\n' > "${GUEST_ROOTFS_DIR}/etc/hostname"
 printf '127.0.0.1 localhost\n' > "${GUEST_ROOTFS_DIR}/etc/hosts"
+# Empty resolv.conf: the guest root is mounted ro (rootflags=...ro), and
+# cube-agent's setup_guest_dns bind-mounts over /etc/resolv.conf when the
+# request carries DNS servers. The bind target must already exist -- creating
+# it at runtime on the ro rootfs fails EROFS and kills create_sandbox.
+: > "${GUEST_ROOTFS_DIR}/etc/resolv.conf"
 
 OUTPUT_IMG="${OUTPUT_DIR}/cube-guest-image-cpu.img"
 OUTPUT_VERSION_FILE="${OUTPUT_DIR}/version"
