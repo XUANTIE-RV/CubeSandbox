@@ -95,15 +95,34 @@ jobs:
             || make all-riscv64 SKIP_BUILDER_IMAGE_CHECK=1
           make l2pause-riscv64 SKIP_BUILDER_IMAGE_CHECK=1 || make l2pause-riscv64
 
+      # Default: use the prebuilt XuanTie (6.6.102 Yocto) kernel from the
+      # ci-assets release -- it is the kernel the nested L2 boot was validated
+      # on (4/4 under control-plane load on 232), and skipping the cross-build
+      # saves the whole kernel-cache/compile stage. Set repo variable
+      # RISCV64_BUILD_KERNEL=1 to build the 7.2 kernel from
+      # configs/kernel-oc9.riscv64.config instead (kernel iteration path).
+      - name: Fetch XuanTie guest kernel Image from ci-assets
+        if: vars.RISCV64_BUILD_KERNEL != '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${WORKLOADS_DIR}"
+          base="https://github.com/${{ github.repository }}/releases/download/ci-assets"
+          curl -fSL --retry 3 -H "Authorization: Bearer ${GH_TOKEN}" \
+            -o "${WORKLOADS_DIR}/Image" "${base}/Image-xuantie-6.6.102"
+          ls -la "${WORKLOADS_DIR}/Image"
+
       - name: Cache 7.2 guest kernel Image
         id: cache-kernel
+        if: vars.RISCV64_BUILD_KERNEL == '1'
         uses: actions/cache@v4
         with:
           path: ${{ env.WORKLOADS_DIR }}/Image
           key: kernel-7.2-riscv64-v1-${{ hashFiles('configs/kernel-oc9.riscv64.config', 'configs/patches/riscv64-dax-zeropage-folio.patch', 'configs/patches/riscv64-kvm-zeropage-dirtylog.patch', 'scripts/build-kernel.sh', 'hypervisor/scripts/build_guest_kernel_riscv64.sh') }}
 
       - name: Build 7.2 guest kernel Image (in-place, cross-compiled)
-        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        if: vars.RISCV64_BUILD_KERNEL == '1' && steps.cache-kernel.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           chmod +x hypervisor/scripts/build_guest_kernel_riscv64.sh
@@ -146,12 +165,12 @@ jobs:
           OUTPUT_DIR="${WORKLOADS_DIR}" CUBE_ARCH=riscv64 \
             hypervisor/scripts/gen_cube_snapshot_assets_riscv64.sh
 
-      - name: Cache control-plane assets (registry/crane/sandbox image/ci layer)
+      - name: Cache control-plane assets (registry/crane/coredns/mkcert/cube-proxy/sandbox image/ci layer)
         id: cache-cp-assets
         uses: actions/cache@v4
         with:
           path: ${{ env.WORKLOADS_DIR }}/control-plane
-          key: control-plane-assets-riscv64-v1
+          key: control-plane-assets-riscv64-v2
 
       - name: Fetch control-plane assets from the ci-assets release
         if: steps.cache-cp-assets.outputs.cache-hit != 'true'
@@ -161,7 +180,7 @@ jobs:
           set -euo pipefail
           mkdir -p "${WORKLOADS_DIR}/control-plane"
           base="https://github.com/${{ github.repository }}/releases/download/ci-assets"
-          for a in registry-riscv64 crane-riscv64 sandbox-riscv64.tar py3-ci-layer-persist.tar.gz; do
+          for a in registry-riscv64 crane-riscv64 coredns-riscv64 mkcert-riscv64 cube-proxy-image.tar sandbox-riscv64.tar py3-ci-layer-persist.tar.gz; do
             echo "=== fetch ${a} ==="
             curl -fSL --retry 3 -H "Authorization: Bearer ${GH_TOKEN}" \
               -o "${WORKLOADS_DIR}/control-plane/${a}" "${base}/${a}"
