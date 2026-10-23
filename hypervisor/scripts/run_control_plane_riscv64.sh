@@ -38,6 +38,41 @@ SHARE="${SHARE:-/mnt/share}"
 TB="${TB:-/usr/local/services/cubetoolbox}"
 DEMO_TIMEOUT="${DEMO_TIMEOUT:-900}"
 TPL_POLL_MAX="${TPL_POLL_MAX:-270}"   # 270 * 20s = 90 min (bed: 18-35 min under TCG)
+# TRACE_KVM=1: capture kvm_entry/kvm_exit tracepoints from the template VM
+# create onward (the wedge-prone window); the ring buffer keeps the tail, i.e.
+# the last guest exits before a wedge -- including the final WFI exits and the
+# guest PCs (sepc) at entry.
+TRACE_KVM="${TRACE_KVM:-0}"
+TRACE_DIR=/sys/kernel/tracing
+TRACE_ACTIVE=0
+
+trace_kvm_start() {
+  [[ "${TRACE_KVM}" == "1" ]] || return 0
+  [[ -d "${TRACE_DIR}/events" ]] || mount -t tracefs tracefs "${TRACE_DIR}" 2>/dev/null || true
+  if [[ ! -e "${TRACE_DIR}/events/kvm/kvm_entry/enable" ]]; then
+    info "WARN: kvm tracepoints unavailable in this L1 kernel; TRACE_KVM ignored"
+    return 0
+  fi
+  echo 131072 > "${TRACE_DIR}/buffer_size_kb" 2>/dev/null || true
+  echo nop > "${TRACE_DIR}/current_tracer" 2>/dev/null || true
+  : > "${TRACE_DIR}/trace"
+  echo 1 > "${TRACE_DIR}/events/kvm/kvm_entry/enable"
+  echo 1 > "${TRACE_DIR}/events/kvm/kvm_exit/enable"
+  echo 1 > "${TRACE_DIR}/tracing_on"
+  TRACE_ACTIVE=1
+  info "kvm entry/exit tracepoint capture enabled"
+}
+
+trace_kvm_stop_dump() {
+  [[ "${TRACE_ACTIVE}" == "1" ]] || return 0
+  echo 0 > "${TRACE_DIR}/tracing_on" 2>/dev/null || true
+  TRACE_ACTIVE=0
+  echo "=== kvm trace: total event lines ==="
+  wc -l < "${TRACE_DIR}/trace" || true
+  echo "=== kvm trace: last 3000 events (unfiltered tail; the wedge pre-history) ==="
+  tail -3000 "${TRACE_DIR}/trace" || true
+  echo "=== end kvm trace ==="
+}
 
 info() { echo "[cp] $(date +%H:%M:%S) $*"; }
 die()  { echo "[cp] ERROR: $*" >&2; exit 2; }
@@ -138,6 +173,9 @@ on_exit() {
   # Marker for the outer runner's gdbstub watcher: on failure, hold the L1 up
   # (below) so the host can attach to the still-wedged L2 before poweroff.
   [[ ${FAILED} -eq 0 ]] || { touch "${SHARE}/.l1-wedged" 2>/dev/null || true; }
+  # Stop + dump the kvm trace FIRST: its tail is the freshest wedge pre-history
+  # and must be captured before the (slow) log dumps below run more guests I/O.
+  trace_kvm_stop_dump
   echo "=== listening sockets (full, unfiltered) ==="
   ss -ltnp 2>/dev/null || true
   dump_net_state "at exit" 2>/dev/null || true
@@ -475,6 +513,9 @@ CMD='/usr/local/bin/envd -port 49983 -isnotfc >/var/log/envd.log 2>&1 & CODE_INT
 /opt/cube-img/crane config "${REG}/sandbox-code-riscv64:persist"
 
 # --- 7) register the template (poll to READY) --------------------------------
+# TRACE_KVM=1: start kvm_entry/kvm_exit capture here so the ring buffer covers
+# the whole template VM boot window (where the 7.2 wedge happens).
+trace_kvm_start
 info "tpl create-from-image (probe 49999 /health, timeout 300s)"
 CM="${TB}/CubeMaster/bin/cubemastercli"
 "${CM}" --address 127.0.0.1 --port 8089 tpl create-from-image \

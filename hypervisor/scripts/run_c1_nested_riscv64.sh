@@ -66,6 +66,9 @@ QEMU="${QEMU:-qemu-system-riscv64}"
 L1_PORT="${L1_PORT:-22699}"
 L1_PREEMPT="${L1_PREEMPT:-none}"
 L1_GDBSTUB="${L1_GDBSTUB:-0}"
+# L1_TRACE_KVM=1 enables kvm_entry/kvm_exit tracepoint capture around the
+# template-create window inside the L1 (defaults to following L1_GDBSTUB).
+L1_TRACE_KVM="${L1_TRACE_KVM:-${L1_GDBSTUB}}"
 L1_GDB_PORT="${L1_GDB_PORT:-12999}"
 RUNDIR="${RUNDIR:-$(mktemp -d /tmp/c1-l1.XXXXXX)}"
 INTEGRATION="${INTEGRATION:-$(dirname "$0")/run_integration_tests_riscv64.sh}"
@@ -97,6 +100,78 @@ dump_gdbstub_forensics() {
     done
   fi
   info "gdbstub forensics: gdb=${gdb} vmlinux=${vmlinux:-none} -> ${log}"
+  # kvmwalk.py: walk the L1 kernel's global vm_list -> struct kvm ->
+  # vcpu_array xarray and dump the per-vCPU interrupt/blocking state. This is
+  # THE discriminator for the 7.2 wedge: irqs_pending!=0 means the virtual
+  # interrupt was injected but the vCPU was never woken (KVM block/kick bug);
+  # irqs_pending==0 means the interrupt never arrived (VMM/QEMU/device side).
+  cat >"${RUNDIR}/kvmwalk.py" <<'PYEOF'
+import gdb
+
+XA_CHUNK_SIZE = 64
+
+def _i(v):
+    try:
+        return int(v)
+    except Exception:
+        return 0
+
+def main():
+    print("=== kvm vm_list / vcpu_array walk ===")
+    try:
+        vm_list = gdb.parse_and_eval('vm_list')
+    except gdb.error as e:
+        print("SKIP: no 'vm_list' symbol (vmlinux not loaded or no debug info): %s" % e)
+        return
+    try:
+        kvm_t = gdb.lookup_type('struct kvm')
+        vcpu_t = gdb.lookup_type('struct kvm_vcpu')
+        node_t = gdb.lookup_type('struct xa_node')
+    except gdb.error as e:
+        print("SKIP: missing debug types: %s" % e)
+        return
+    vm_list_off = kvm_t['vm_list'].bitpos // 8
+    head = _i(vm_list.address)
+    nxt = _i(vm_list['next'])
+    nvms = 0
+    while nxt and nxt != head and nvms < 16:
+        kvm = gdb.Value(nxt - vm_list_off).cast(kvm_t.pointer()).dereference()
+        nvms += 1
+        print("--- kvm @ %#x: online_vcpus=%d ---" % (nxt - vm_list_off, _i(kvm['online_vcpus']['counter'])))
+        vcpus = []
+        def walk(p):
+            a = _i(p)
+            if a == 0:
+                return
+            if (a & 3) == 2:
+                node = gdb.Value(a & ~3).cast(node_t.pointer()).dereference()
+                for i in range(XA_CHUNK_SIZE):
+                    walk(node['slots'][i])
+            elif (a & 3) == 0:
+                vcpus.append(a)
+        try:
+            walk(kvm['vcpu_array']['xa_head'])
+        except Exception as e:
+            print("  xarray walk failed: %s" % e)
+        for va in sorted(vcpus):
+            try:
+                v = gdb.Value(va).cast(vcpu_t.pointer()).dereference()
+                arch = v['arch']
+                print("  vcpu @ %#x: vcpu_id=%d cpu=%d mode=%d" % (va, _i(v['vcpu_id']), _i(v['cpu']), _i(v['mode'])))
+                print("    irqs_pending=%#x irqs_pending_mask=%#x" % (_i(arch['irqs_pending'][0]), _i(arch['irqs_pending_mask'][0])))
+                print("    guest_csr: vsie=%#x hvip=%#x" % (_i(arch['guest_csr']['vsie']), _i(arch['guest_csr']['hvip'])))
+                print("    guest_context.sepc=%#x" % _i(arch['guest_context']['sepc']))
+                print("    timer: next_set=%d next_cycles=%d sstc=%d" % (_i(arch['timer']['next_set']), _i(arch['timer']['next_cycles']), _i(arch['timer']['sstc_enabled'])))
+                print("    stat: blocking=%d halt_wakeup=%d" % (_i(v['stat']['generic']['blocking']), _i(v['stat']['generic']['halt_wakeup'])))
+            except Exception as e:
+                print("  vcpu @ %#x: read failed: %s" % (va, e))
+        nxt = _i(gdb.Value(nxt).cast(gdb.lookup_type('struct list_head').pointer()).dereference()['next'])
+    if nvms == 0:
+        print("(vm_list empty -- no VMs in this L1?)")
+    print("=== end kvm walk ===")
+
+main()
+PYEOF
   {
     echo "=== gdbstub forensics ($(date -u +%FT%TZ)) ==="
     echo "gdb: ${gdb}"
@@ -106,11 +181,14 @@ dump_gdbstub_forensics() {
       -ex "set pagination off" \
       -ex "set architecture riscv:rv64" \
       -ex "target remote 127.0.0.1:${L1_GDB_PORT}" \
+      -ex "info files" \
+      -ex "info address vm_list" \
       -ex "monitor info status" \
       -ex "monitor info cpus" \
       -ex "info threads" \
       -ex "thread apply all bt" \
       -ex "thread apply all info registers" \
+      -ex "source ${RUNDIR}/kvmwalk.py" \
       -ex "detach" 2>&1
     echo "=== end gdbstub forensics ==="
   } >"${log}" 2>&1
@@ -460,7 +538,7 @@ case "${RUN_MODE}" in
         sleep 3
       done
       [[ -s /mnt/share/run_control_plane_riscv64.sh ]] || { echo \"FATAL: 9p share never populated\"; exit 1; }
-      bash /mnt/share/run_control_plane_riscv64.sh < /dev/null
+      TRACE_KVM=${L1_TRACE_KVM} bash /mnt/share/run_control_plane_riscv64.sh < /dev/null
       echo \$? > /mnt/share/control-plane.rc
       sync
       poweroff -f
