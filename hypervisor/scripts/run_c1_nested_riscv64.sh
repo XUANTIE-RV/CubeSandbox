@@ -95,7 +95,8 @@ if [[ "${RUN_MODE}" == "control-plane" ]]; then
            cubevsmapdump-riscv64; do
     [[ -x "${BIN_DIR}/${b}" ]] || die "missing control-plane binary ${BIN_DIR}/${b} -- run 'make all-riscv64'"
   done
-  for a in registry-riscv64 crane-riscv64 sandbox-riscv64.tar py3-ci-layer-persist.tar.gz; do
+  for a in registry-riscv64 crane-riscv64 coredns-riscv64 mkcert-riscv64 \
+           cube-proxy-image.tar sandbox-riscv64.tar py3-ci-layer-persist.tar.gz; do
     [[ -s "${CP_ASSETS_DIR}/${a}" ]] || die "missing control-plane asset ${CP_ASSETS_DIR}/${a} (ci-assets release)"
   done
 fi
@@ -116,9 +117,18 @@ fi
 RFMT=$(qemu-img info --output=json "${ROOTFS_SRC}" | sed -n 's/.*"format": *"\([^"]*\)".*/\1/p' | head -1)
 [[ -n "${RFMT}" ]] || RFMT=raw
 # Use the fetched image as a read-only backing; the overlay absorbs all writes.
+# L1_GOLDEN_QCOW2: a previously saved post-apt disk (see SAVE_GOLDEN_QCOW2
+# below) -- booting a copy of it lets the in-L1 script skip the ~40-min
+# apt install. The golden disk is pre-control-plane, so no per-run state
+# (mysql rows, templates, sandboxes) leaks between runs.
 ROOT_OVL="${RUNDIR}/ubuntu-l1.qcow2"
-qemu-img create -f qcow2 -b "${ROOTFS_SRC}" -F "${RFMT}" "${ROOT_OVL}" >/dev/null
-qemu-img resize "${ROOT_OVL}" 12G >/dev/null
+if [[ -n "${L1_GOLDEN_QCOW2:-}" && -s "${L1_GOLDEN_QCOW2}" ]]; then
+  info "using golden L1 disk ${L1_GOLDEN_QCOW2} (apt stage pre-installed)"
+  cp --reflink=auto "${L1_GOLDEN_QCOW2}" "${ROOT_OVL}"
+else
+  qemu-img create -f qcow2 -b "${ROOTFS_SRC}" -F "${RFMT}" "${ROOT_OVL}" >/dev/null
+  qemu-img resize "${ROOT_OVL}" 12G >/dev/null
+fi
 DATA_DISK="${RUNDIR}/data.raw"
 qemu-img create -f raw "${DATA_DISK}" 8G >/dev/null
 
@@ -127,7 +137,11 @@ SSH_KEY="${RUNDIR}/id_l1"
 ssh-keygen -t ed25519 -N '' -f "${SSH_KEY}" -C c1-l1 >/dev/null
 SEED_DIR="${RUNDIR}/seed"; mkdir -p "${SEED_DIR}"
 cat > "${SEED_DIR}/meta-data" <<EOF
-instance-id: c1-l1
+# Unique instance-id per run: with L1_GOLDEN_QCOW2 the disk already ran
+# cloud-init under the old id, and a matching id makes cloud-init skip the
+# per-instance modules -- the fresh pubkey would never be injected and the
+# ssh wait loop would time out (hit in replay-ali6000-r6).
+instance-id: c1-l1-$(date +%s)
 local-hostname: c1l1
 EOF
 cat > "${SEED_DIR}/user-data" <<EOF
@@ -211,7 +225,17 @@ if [[ "${RUN_MODE}" == "control-plane" ]]; then
   cp -f "${REPO}"/hypervisor/scripts/control-plane-riscv64/* "${SHARE}/cpconf/"
   cp -f "${REPO}/deploy/one-click/config-cube.toml" "${SHARE}/config-cube.toml"
   cp -f "${REPO}/examples/openai-agents-code-interpreter/coldstart_snapshot_demo.py" "${SHARE}/coldstart_snapshot_demo.py"
-  cp -f "${CP_ASSETS_DIR}"/{registry-riscv64,crane-riscv64,sandbox-riscv64.tar,py3-ci-layer-persist.tar.gz} "${SHARE}/cpassets/"
+  cp -f "${CP_ASSETS_DIR}"/{registry-riscv64,crane-riscv64,coredns-riscv64,mkcert-riscv64,cube-proxy-image.tar,sandbox-riscv64.tar,py3-ci-layer-persist.tar.gz} "${SHARE}/cpassets/"
+  mkdir -p "${SHARE}/cpproxy"
+  cp -f "${REPO}/CubeProxy/nginx.conf" "${SHARE}/cpproxy/nginx.conf"
+  cp -f "${REPO}/deploy/one-click/cubeproxy/global.conf.template" "${SHARE}/cpproxy/global.conf.template"
+  # CP_STOP_AFTER_STAGE=1: the in-L1 script exits right after toolbox staging
+  # (special rc 77) so the caller can save the disk as a golden image.
+  if [[ "${CP_STOP_AFTER_STAGE:-0}" == "1" ]]; then
+    : > "${SHARE}/.stop-after-stage"
+  else
+    rm -f "${SHARE}/.stop-after-stage"
+  fi
 fi
 
 # --- boot the L1 (QEMU TCG, H-ext + AIA), host-forward ssh, 9p share ---------
@@ -366,6 +390,17 @@ case "${RUN_MODE}" in
     # the backstop for an in-L1 wedge (poweroff never runs then).
     rc=$(cat "${SHARE}/control-plane.rc" 2>/dev/null || echo 255)
     set -e
+
+    if [[ "${rc}" -eq 77 && -n "${SAVE_GOLDEN_QCOW2:-}" ]]; then
+      cp --reflink=auto "${ROOT_OVL}" "${SAVE_GOLDEN_QCOW2}"
+      info "golden L1 disk saved to ${SAVE_GOLDEN_QCOW2}"
+      echo "=== full control-plane.log ==="
+      cat "${RUNDIR}/control-plane.log"
+      echo "=== end control-plane.log ==="
+      trap - EXIT
+      kill "${QPID}" 2>/dev/null || true
+      exit 0
+    fi
 
     echo "=== full control-plane.log ==="
     cat "${RUNDIR}/control-plane.log"

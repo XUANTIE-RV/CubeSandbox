@@ -110,6 +110,9 @@ for f in cpconf/cubemaster-conf.yaml cpconf/templatecenter-conf.yaml \
          cpconf/cubelet-config.toml cpconf/cubelet-dynamicconf.yaml \
          config-cube.toml coldstart_snapshot_demo.py \
          cpassets/registry-riscv64 cpassets/crane-riscv64 \
+         cpassets/coredns-riscv64 \
+         cpassets/mkcert-riscv64 cpassets/cube-proxy-image.tar \
+         cpproxy/nginx.conf cpproxy/global.conf.template \
          cpassets/sandbox-riscv64.tar cpassets/py3-ci-layer-persist.tar.gz \
          Image cube-guest-image-cpu.img cube-agent.ext4; do
   [[ -s "${SHARE}/${f}" ]] || die "missing ${SHARE}/${f}"
@@ -123,12 +126,20 @@ mountpoint -q /data && info "/data mounted: $(findmnt -n -o FSTYPE /data)" || di
 # Yocto-built 8.4 deb from the XuanTie feed (install-native-db.sh) does NOT fit
 # here -- it links OpenSSL 3.4 while noble ships 3.0. Native distro packages
 # avoid docker-in-TCG entirely. Full apt output on purpose.
-info "apt-get update + install mysql-server redis-server python3-venv"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y mysql-server redis-server python3-venv python3-pip curl
-mysqld --version
-redis-server --version
+# Golden-disk runs (marker present) skip this ~40-min step; the installed
+# packages persist on the reused disk.
+if [[ -f /etc/c1-cp-apt-done ]]; then
+  info "apt stage already done on this disk (golden); skipping"
+else
+  info "apt-get update + install mysql-server redis-server python3-venv"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y mysql-server redis-server python3-venv python3-pip curl docker.io
+  mysqld --version
+  redis-server --version
+  dockerd --version
+  touch /etc/c1-cp-apt-done
+fi
 
 # --- 2) MySQL: datadir + cube_mvp + cube user --------------------------------
 # mysql_native_password users (the CubeSandbox DSN is plain TCP, no TLS).
@@ -155,9 +166,13 @@ until mysqladmin ping --socket=/var/run/mysqld/mysqld.sock --silent 2>/dev/null;
   sleep 2
 done
 info "mysqld ready after ~$((i*2))s"
-# root@localhost authenticates via auth_socket on Ubuntu; this client runs as
-# root, so the socket path below needs no password.
-mysql --socket=/var/run/mysqld/mysqld.sock -uroot <<'SQL'
+# root@localhost authenticates via auth_socket on a fresh install, but the SQL
+# below switches it to mysql_native_password/cube_root -- so on a golden disk
+# (where that ALTER already ran) the socket login needs the password.
+ROOT_AUTH=()
+mysql --socket=/var/run/mysqld/mysqld.sock -uroot -e "SELECT 1" >/dev/null 2>&1 \
+  || ROOT_AUTH=(-pcube_root)
+mysql --socket=/var/run/mysqld/mysqld.sock -uroot "${ROOT_AUTH[@]}" <<'SQL'
 CREATE DATABASE IF NOT EXISTS cube_mvp CHARACTER SET utf8mb4;
 ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY 'cube_root';
 CREATE USER IF NOT EXISTS 'cube'@'%' IDENTIFIED WITH mysql_native_password BY 'cube_pass';
@@ -226,9 +241,52 @@ cp -f "${SHARE}/Image" "${TB}/cube-kernel-scf/vmlinux"
 cp -f "${SHARE}/cube-guest-image-cpu.img" "${TB}/cube-image/cube-guest-image-cpu.img"
 cp -f "${SHARE}/cube-agent.ext4" "${TB}/cube-agent/cube-agent.ext4"
 for d in cube-kernel-scf cube-image cube-agent; do echo "0.0.0-dev" > "${TB}/${d}/version"; done
+echo "0.0.0-dev" > "${TB}/cube-shim/version"
+# Inventory the staged components into cubelet's versioned store, mirroring
+# one-click install.sh inventory_package_component_versions. Sandbox.create
+# resolves component versions from /data/cubelet/root/component_versions/
+# <name>/<ver>/ and only falls back to the CubeOps component warehouse when a
+# version is missing locally; this single-node layout runs no MinIO/S3, so
+# without the inventory step Sandbox.create fails with
+# "component version not in warehouse: warehouse disabled".
+CVROOT=/data/cubelet/root/component_versions
+for name in cube-shim cube-image cube-agent; do
+  ver="$(tr -d '[:space:]' < "${TB}/${name}/version")"
+  dst="${CVROOT}/${name}/${ver}"
+  # Dev builds reuse the same version string with changing content, so always
+  # refresh those; released versions follow install.sh's keep-existing rule.
+  if [[ "${ver}" == *-dev || ! -d "${dst}" ]]; then
+    mkdir -p "${CVROOT}/${name}"
+    rm -rf "${dst}.new"
+    cp -a "${TB}/${name}" "${dst}.new"
+    rm -rf "${dst}"
+    mv "${dst}.new" "${dst}"
+  fi
+done
+# The kernel inventories by content hash (sha256-<12> of vmlinux) with a bm
+# variant file, matching install.sh inventory_kernel_content_variants.
+kdigest="$(sha256sum "${TB}/cube-kernel-scf/vmlinux" | awk '{print $1}')"
+kdst="${CVROOT}/cube-kernel-scf/sha256-${kdigest:0:12}"
+if [ ! -d "${kdst}" ]; then
+  mkdir -p "${kdst}"
+  cp -f "${TB}/cube-kernel-scf/vmlinux" "${kdst}/vmlinux-bm"
+  ln -sfn vmlinux-bm "${kdst}/vmlinux"
+  echo bm > "${kdst}/variant"
+  echo "sha256:${kdigest}" > "${kdst}/version"
+fi
 # Empty-but-valid snapshot spec list (loadVmSnapshotSpec tolerates a missing
 # file with a warning; an explicit [] keeps the log clean).
 echo '[]' > "${TB}/cube-snapshot/spec.json"
+
+# Golden-image producer mode: the outer script drops this marker when invoked
+# with CP_STOP_AFTER_STAGE=1. Everything above (apt marker + toolbox staging +
+# component inventory) is the disk state worth freezing; mysql/redis services
+# are (re)started per run below, so stopping here keeps the golden disk free
+# of any per-run control-plane state. rc 77 tells the outer script to save it.
+if [[ -f /mnt/share/.stop-after-stage ]]; then
+  info "CP_STOP_AFTER_STAGE: staging complete, stopping for golden capture"
+  exit 77
+fi
 
 # --- 5) start the control plane ----------------------------------------------
 # Order mirrors the bed systemd units: cubeops -> cubemaster -> templatecenter
@@ -388,6 +446,99 @@ info "TEMPLATE_READY ${TID}"
 "${CM}" --address 127.0.0.1 --port 8089 tpl ls
 
 # --- 8) run the no-LLM demo --------------------------------------------------
+# The SDK data plane (run_code -> envd) dials <port>-<sandboxID>.cube.app, so
+# the demo needs wildcard DNS for *.cube.app -> this node. Mirror the validated
+# bed: coredns on a dummy interface (169.254.254.53), prepended to resolv.conf.
+info "start coredns for *.cube.app -> ${CUBE_SANDBOX_NODE_IP}"
+install -m 0755 "${SHARE}/cpassets/coredns-riscv64" /usr/local/bin/coredns
+ip link show cube-dns0 >/dev/null 2>&1 || ip link add cube-dns0 type dummy
+ip addr replace 169.254.254.53/32 dev cube-dns0 2>/dev/null
+ip link set cube-dns0 up
+mkdir -p "${TB}/coredns"
+cat > "${TB}/coredns/Corefile" <<CORE
+cube.app:53 {
+    bind 169.254.254.53
+    template IN A cube.app {
+        answer "{{ .Name }} 60 IN A ${CUBE_SANDBOX_NODE_IP}"
+        fallthrough
+    }
+    cache 300
+}
+.:53 {
+    bind 169.254.254.53
+    forward . 10.0.2.3 10.0.2.2 8.8.8.8
+    cache 30
+}
+CORE
+setsid nohup /usr/local/bin/coredns -conf "${TB}/coredns/Corefile" \
+  >/data/log/coredns.log 2>&1 </dev/null &
+grep -q 169.254.254.53 /etc/resolv.conf 2>/dev/null \
+  || sed -i "1i nameserver 169.254.254.53" /etc/resolv.conf
+for _ in $(seq 1 15); do
+  getent hosts probe.cube.app 2>/dev/null | grep -q "${CUBE_SANDBOX_NODE_IP}" && break
+  sleep 2
+done
+getent hosts probe.cube.app >/dev/null 2>&1 || die "coredns: *.cube.app does not resolve"
+
+# --- 8.5) cube-proxy data plane (OpenResty in docker, host network) ---------
+# run_code dials http://<envd-port>-<sandboxID>.cube.app/execute on :80;
+# cube-proxy is the only component that terminates that Host-based routing
+# (lua -> cubevs eBPF DNAT -> L2 envd). dockerd runs with --iptables=false
+# --bridge=none: the container is host-networked, so docker's NAT/bridge
+# plumbing (and its netfilter module demands on the L1 kernel) is unneeded.
+info "start dockerd + cube-proxy (OpenResty data plane on :80)"
+mkdir -p /data/log/cube-proxy
+nohup dockerd --iptables=false --bridge=none >/data/log/dockerd.log 2>&1 </dev/null &
+for i in $(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 2; done
+docker info >/dev/null 2>&1 || die "dockerd not ready (see /data/log/dockerd.log)"
+
+install -m 0755 "${SHARE}/cpassets/mkcert-riscv64" /usr/local/bin/mkcert
+PROXYTB="${TB}/cubeproxy"
+mkdir -p "${PROXYTB}/certs"
+mkcert -install
+(cd "${PROXYTB}/certs" && mkcert cube.app "*.cube.app" localhost 127.0.0.1)
+[[ -s "${PROXYTB}/certs/cube.app+3.pem" ]] || die "mkcert did not produce cube.app+3.pem"
+
+sed -e 's/__CUBE_PROXY_REDIS_IP__/127.0.0.1/g' \
+    -e 's/__CUBE_PROXY_REDIS_PORT__/6379/g' \
+    -e 's/__CUBE_PROXY_REDIS_PASSWORD__/ceuhvu123/g' \
+    -e 's/__CUBE_PROXY_REDIS_MASTER_NAME__//g' \
+    -e 's/__CUBE_PROXY_REDIS_SENTINEL_NODES__//g' \
+    -e 's/__CUBE_PROXY_REDIS_SENTINEL_PASSWORD__//g' \
+    -e 's/__CUBE_PROXY_REDIS_DB__/0/g' \
+    -e "s/__CUBE_PROXY_HOST_IP__/${CUBE_SANDBOX_NODE_IP}/g" \
+    -e 's#__CUBE_SIDECAR_NGX_ADDR__#127.0.0.1:8083#g' \
+    -e 's#__CUBE_ADMIN_TOKEN__##g' \
+    "${SHARE}/cpproxy/global.conf.template" > "${PROXYTB}/global.conf"
+
+# Repo CubeProxy/nginx.conf carries literal dev ports (8081 http / 8080
+# https); the release bundle turns them into __CUBE_PROXY_*_PORT__
+# placeholders that up-cube-proxy.sh renders as 80/443. Substitute directly.
+sed -e 's/listen 8081 reuseport;/listen 80 reuseport;/' \
+    -e 's/listen 8080 ssl reuseport;/listen 443 ssl reuseport;/' \
+    "${SHARE}/cpproxy/nginx.conf" > "${PROXYTB}/nginx.conf"
+grep -q 'listen 80 reuseport;' "${PROXYTB}/nginx.conf" || die "cube-proxy nginx.conf render failed"
+
+docker load -i "${SHARE}/cpassets/cube-proxy-image.tar"
+PROXY_IMAGE="$(docker images --format '{{.Repository}}:{{.Tag}}' | grep -i cube-proxy | head -1)"
+[[ -n "${PROXY_IMAGE}" ]] || die "cube-proxy image not loaded"
+info "cube-proxy image: ${PROXY_IMAGE}"
+docker rm -f cube-proxy >/dev/null 2>&1 || true
+docker run -d --name cube-proxy --network host \
+  -e CUBE_PROXY_REGISTRY_ENABLE=0 \
+  -e CUBE_PROXY_NODE_IP="${CUBE_SANDBOX_NODE_IP}" \
+  -v /data/log/cube-proxy:/data/log/cube-proxy \
+  -v "${PROXYTB}/certs:/usr/local/openresty/nginx/certs:ro" \
+  -v "${PROXYTB}/global.conf:/usr/local/openresty/nginx/conf/global/global.conf:ro" \
+  -v "${PROXYTB}/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro" \
+  "${PROXY_IMAGE}"
+for i in $(seq 1 30); do
+  ss -lnt | grep -q ':80 ' && break
+  sleep 2
+done
+ss -lnt | grep -q ':80 ' || die "cube-proxy not listening on :80"
+info "cube-proxy listening on :80 (container: $(docker ps --format '{{.Names}} {{.Status}}' | grep cube-proxy))"
+
 info "python venv + cubesandbox SDK"
 python3 -m venv /opt/demo-venv
 /opt/demo-venv/bin/pip install "cubesandbox>=0.2.0" python-dotenv
