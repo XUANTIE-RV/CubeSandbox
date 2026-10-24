@@ -116,9 +116,16 @@ wedge_watch() {
             c=$(cat "${t}/comm" 2>/dev/null) || continue
             case "${c}" in *vcpu*) awk '{print $1, $14+$15}' "${t}/stat" 2>/dev/null;; esac
           done)
-      # identical snapshots = every vcpu thread at zero jiffies delta for 30s
-      if [[ "${a}" == "${b}" ]]; then
-        info "WEDGE DETECTED: all vcpu threads of shim ${pid} idle for 30s, no VsockServerReady"
+      # Wedge = vcpu threads nearly idle for 30s with no VsockServerReady.
+      # iter-5 lesson: an exact-identity check misses the wedge flavor where
+      # vcpu0 keeps a 10ms guest tick (each timer-exit round trip charges a
+      # few jiffies/30s) while vcpu1 sits in WFI forever. A booting vcpu
+      # burns ~3000 jiffies/30s; a ticking-but-stuck one burns < 30.
+      local delta
+      delta=$(join -j 1 <(echo "${a}" | sort) <(echo "${b}" | sort) 2>/dev/null \
+              | awk '{s += $3-$2} END {print s+0}')
+      if [[ "${delta}" -lt 100 ]]; then
+        info "WEDGE DETECTED: vcpu threads of shim ${pid} at ${delta} jiffies over 30s, no VsockServerReady"
         # Marker FIRST: the outer runner's gdbstub dump must attach while the
         # wedged vCPUs still exist (it takes ~60s to walk vm_list).
         touch "${SHARE}/.l1-wedged" 2>/dev/null || true
