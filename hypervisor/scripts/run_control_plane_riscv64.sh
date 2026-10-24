@@ -121,11 +121,17 @@ wedge_watch() {
       # vcpu0 keeps a 10ms guest tick (each timer-exit round trip charges a
       # few jiffies/30s) while vcpu1 sits in WFI forever. A booting vcpu
       # burns ~3000 jiffies/30s; a ticking-but-stuck one burns < 30.
+      # iter-6 lesson: under nested TCG + active tracepoints the ticking
+      # flavor can exceed 100 jiffies/30s, so add a pure time fallback:
+      # the healthy baseline (6.6) reaches READY 9m41s after create
+      # (~6 min after sampling starts); 24 iterations = grace 240s + 12min
+      # still leaves ~4min of live-VM forensics before the 1200s shim
+      # timeout tears the VM down.
       local delta
       delta=$(join -j 1 <(echo "${a}" | sort) <(echo "${b}" | sort) 2>/dev/null \
               | awk '{s += $3-$2} END {print s+0}')
-      if [[ "${delta}" -lt 100 ]]; then
-        info "WEDGE DETECTED: vcpu threads of shim ${pid} at ${delta} jiffies over 30s, no VsockServerReady"
+      if [[ "${delta}" -lt 100 || "${i}" -ge 24 ]]; then
+        info "WEDGE DETECTED: vcpu threads of shim ${pid} at ${delta} jiffies over 30s (iteration ${i}), no VsockServerReady"
         # Marker FIRST: the outer runner's gdbstub dump must attach while the
         # wedged vCPUs still exist (it takes ~60s to walk vm_list).
         touch "${SHARE}/.l1-wedged" 2>/dev/null || true
